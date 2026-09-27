@@ -4762,7 +4762,25 @@ show_nginx_realtime_status() {
         echo "${14} ${15}"
       done | awk -v n="$ncpu" -v hz="$(getconf CLK_TCK 2>/dev/null || echo 100)" '{ut+=$1; st+=$2} END {if(NR==0) print "0.0"; else printf "%.1f", (ut+st)/hz*100/n/100}')"
     fi
+    # mem: ps -o %mem= 不可用时回退 /proc/stat 的 rss 字段（第 24 字段，单位页）× 页大小 / MemTotal
     mem_val="$(ps -C nginx -o %mem= 2>/dev/null | awk '{s+=$1} END {if(NR==0) print "0.0"; else printf "%.1f", s}')"
+    if [[ "${mem_val:-0.0}" == "0.0" ]] && [[ -z "$(ps -C nginx -o pid= 2>/dev/null)" ]]; then
+      local page_size mem_total
+      page_size="$(getconf PAGESIZE 2>/dev/null || echo 4096)"
+      mem_total="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)"
+      case "$mem_total" in
+        ''|*[!0-9]*) mem_total=0 ;;
+      esac
+      if [[ "$mem_total" -gt 0 ]]; then
+        mem_val="$(for st in /proc/[0-9]*/stat; do
+          read -r line < "$st" 2>/dev/null || continue
+          [[ "$line" == *'nginx'* ]] || continue
+          # shellcheck disable=SC2086  # 刻意按空白拆分（同上）
+          set -- $line
+          echo "${23}"
+        done | awk -v ps="$page_size" -v mt="$mem_total" '{rss+=$1} END {if(NR==0) print "0.0"; else printf "%.1f", rss*ps/1024/mt*100}')"
+      fi
+    fi
     cpu="${cpu_val:-0.0}"
     mem="${mem_val:-0.0}"
 
