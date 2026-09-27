@@ -837,6 +837,24 @@ is_port_used_os() {
   fi
 }
 
+# 通用「本机 TCP 监听」检测：ss → netstat → /proc/net/tcp 兜底（BusyBox 兼容）
+nginx_port_listening() {
+  local p="$1"
+  if check_cmd ss; then
+    if ss -lnt 2>/dev/null | awk 'NR>1{print $4}' | grep -qE "(^|:)${p}$"; then
+      return 0
+    fi
+  elif check_cmd netstat; then
+    if netstat -lnt 2>/dev/null | awk 'NR>2{print $4}' | grep -qE "(^|:)${p}$"; then
+      return 0
+    fi
+  fi
+  # 兜底：直接解析 /proc/net/tcp（本地地址列为十六进制，如 00000000:0050）
+  local hex
+  hex="$(printf '%04X' "$p")"
+  grep -qiE ":${hex}[[:space:]]+00000000:0000" /proc/net/tcp 2>/dev/null
+}
+
 port_has_ssl_listener() {
   local p="$1"
   grep -R -E "listen[[:space:]]+${p}([[:space:]]|;).*ssl" "${CONF_DIR}"/*.conf >/dev/null 2>&1
@@ -3362,8 +3380,8 @@ precheck_http01() {
   fi
   info "DNS解析：${dns_out}"
 
-  # 2) 本机80监听检查
-  if ! ss -lnt | awk 'NR>1{print $4}' | grep -qE '(^|:)80$'; then
+  # 2) 本机80监听检查（ss/netstat//proc 兜底，BusyBox 兼容）
+  if ! nginx_port_listening 80; then
     error "自检失败：本机未监听 80 端口。"
     return 11
   fi
@@ -4726,8 +4744,27 @@ show_nginx_realtime_status() {
       qps="$(awk -v current="$requests" -v previous="$prev_requests" 'BEGIN { delta=current-previous; if (delta<0) delta=0; printf "%.1f", delta/5 }')"
     fi
 
-    cpu="$(ps -C nginx -o %cpu= 2>/dev/null | awk '{s+=$1} END {if(NR==0) print "0.0"; else printf "%.1f", s}')"
-    mem="$(ps -C nginx -o %mem= 2>/dev/null | awk '{s+=$1} END {if(NR==0) print "0.0"; else printf "%.1f", s}')"
+    # ps -C/-o 为 procps 语法，BusyBox 不可用；回退解析 /proc/<pid>/stat（CPU 为有符号整数百分比，除以核心数）
+    local ncpu=1
+    ncpu="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+    case "$ncpu" in
+      ''|*[!0-9]*) ncpu=1 ;;
+    esac
+    local cpu_val mem_val
+    cpu_val="$(ps -C nginx -o %cpu= 2>/dev/null | awk '{s+=$1} END {if(NR==0) print "0.0"; else printf "%.1f", s}')"
+    if [[ "${cpu_val:-0.0}" == "0.0" ]] && [[ -z "$(ps -C nginx -o pid= 2>/dev/null)" ]]; then
+      cpu_val="$(for st in /proc/[0-9]*/stat; do
+        read -r line < "$st" 2>/dev/null || continue
+        [[ "$line" == *'nginx'* ]] || continue
+        # shellcheck disable=SC2086  # 刻意按空白拆分；nginx 进程名含空格/括号时 procstat 取不到
+        set -- $line
+        # 字段 14=utime, 15=stime（含 comm 括号偏移后取 $14/$15）
+        echo "${14} ${15}"
+      done | awk -v n="$ncpu" -v hz="$(getconf CLK_TCK 2>/dev/null || echo 100)" '{ut+=$1; st+=$2} END {if(NR==0) print "0.0"; else printf "%.1f", (ut+st)/hz*100/n/100}')"
+    fi
+    mem_val="$(ps -C nginx -o %mem= 2>/dev/null | awk '{s+=$1} END {if(NR==0) print "0.0"; else printf "%.1f", s}')"
+    cpu="${cpu_val:-0.0}"
+    mem="${mem_val:-0.0}"
 
     workers="$(pgrep -fc 'nginx: worker process' 2>/dev/null || echo 0)"
     master_pid="$(pgrep -xo nginx 2>/dev/null || true)"
