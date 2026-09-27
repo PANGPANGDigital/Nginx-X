@@ -4777,7 +4777,7 @@ show_nginx_realtime_status() {
           [[ "$line" == *'nginx'* ]] || continue
           # shellcheck disable=SC2086  # 刻意按空白拆分（同上）
           set -- $line
-          echo "${23}"
+          echo "${24}"
         done | awk -v ps="$page_size" -v mt="$mem_total" '{rss+=$1} END {if(NR==0) print "0.0"; else printf "%.1f", rss*ps/1024/mt*100}')"
       fi
     fi
