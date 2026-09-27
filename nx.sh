@@ -15,7 +15,7 @@ NC='\033[0m'
 
 # ---------- 全局变量 ----------
 APP_NAME="Nginx-X"
-APP_VERSION="2.0.0 (2026-09-15)"
+APP_VERSION="2.1.0 (2026-09-27)"
 # Alpine 的 nginx 把 server 配置放在 http.d，其他系统用 conf.d
 if [[ -f /etc/nginx/http.d ]] || [[ -d /etc/nginx/http.d ]]; then
   CONF_DIR="/etc/nginx/http.d"
@@ -28,6 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nginxx"
 EMAIL_CONF="${STATE_DIR}/email.conf"
 DNS_CONF="${STATE_DIR}/dns.conf"
+DOMAIN_ONLY_STATE="${STATE_DIR}/domain-only.conf"
 REPO_URL="https://github.com/Xiuyixx/Nginx-X.git"
 REPO_BRANCH="main"
 REPO_INSTALL_DIR="/opt/Nginx-X"
@@ -1471,6 +1472,10 @@ ensure_ssl_directives_present() {
   local conf_file="$1"
 
   if grep -qE 'listen[[:space:]]+[^;]*[[:space:]]ssl([[:space:]]|;)' "$conf_file" 2>/dev/null; then
+    # “仅域名访问”catch-all 使用 ssl_reject_handshake 拒绝握手，无需证书
+    if grep -q 'ssl_reject_handshake' "$conf_file" 2>/dev/null; then
+      return 0
+    fi
     if ! grep -qE '^[[:space:]]*ssl_certificate[[:space:]]+' "$conf_file" 2>/dev/null; then
       error "检测到 HTTPS 监听，但缺少 ssl_certificate：${conf_file}"
       return 1
@@ -1510,6 +1515,7 @@ apply_conf_with_rollback() {
   if test_output="$(${SUDO} nginx -t 2>&1)"; then
     if reload_nginx_safe; then
       [[ -f "$backup" ]] && ${SUDO} rm -f "$backup"
+      domain_only_after_apply
       return 0
     fi
 
@@ -1791,12 +1797,14 @@ list_managed_conf_files() {
     find "$CONF_DIR" -maxdepth 1 -type f \( -name '*.conf' -o -name '*.conf.*' \) \
       ! -name 'nginx_status.conf*' \
       ! -name '00-websocket-map.conf*' \
+      ! -name '00-nx-domain-only.conf*' \
       ! -name 'acme-challenge-*.conf*' \
       -exec grep -l '^# managed_by=Nginx-X$' {} + 2>/dev/null | sort || true
   else
     find "$CONF_DIR" -maxdepth 1 -type f -name '*.conf' \
       ! -name 'nginx_status.conf*' \
       ! -name '00-websocket-map.conf*' \
+      ! -name '00-nx-domain-only.conf*' \
       ! -name 'acme-challenge-*.conf*' \
       -exec grep -l '^# managed_by=Nginx-X$' {} + 2>/dev/null | sort || true
   fi
@@ -1853,6 +1861,7 @@ enable_conf() {
   if nginx_test; then
     reload_nginx_safe
     info "已启用：$(basename "$dst")"
+    domain_only_rebuild_if_enabled || true
   else
     ${SUDO} mv "$dst" "$src"
     error "启用后配置校验失败，已回滚。"
@@ -1881,6 +1890,7 @@ disable_conf() {
   if nginx_test; then
     reload_nginx_safe
     info "已停用：$(basename "$dst")"
+    domain_only_rebuild_if_enabled || true
   else
     ${SUDO} mv "$dst" "$src"
     error "停用后配置校验失败，已回滚。"
@@ -1963,6 +1973,7 @@ modify_conf() {
     if [[ "$src" != "$new_target" && -f "$src" ]]; then
       ${SUDO} rm -f "$src"
     fi
+    domain_only_rebuild_if_enabled || true
 
     info "配置已修改并生效。"
 
@@ -1971,6 +1982,7 @@ modify_conf() {
       if nginx_test; then
         reload_nginx_safe
         info "配置已保存并停用，可稍后在配置列表中启用。"
+        domain_only_rebuild_if_enabled || true
       else
         ${SUDO} mv "${new_target}.bak" "$new_target"
         error "停用失败，已恢复启用状态。"
@@ -2156,6 +2168,7 @@ modify_external_conf() {
     if [[ "$src" != "$new_target" && -f "$src" ]]; then
       ${SUDO} rm -f "$src"
     fi
+    domain_only_rebuild_if_enabled || true
 
     if [[ "$force_enable_https" == "1" || "$was_https_enabled" == "1" ]]; then
       if [[ ! -f "${SSL_DIR}/${new_domain}/fullchain.pem" || ! -f "${SSL_DIR}/${new_domain}/privkey.pem" ]]; then
@@ -2186,6 +2199,7 @@ modify_external_conf() {
       if nginx_test; then
         reload_nginx_safe
         info "原配置处于停用状态，已保持为停用。"
+        domain_only_rebuild_if_enabled || true
       else
         ${SUDO} mv "${new_target}.bak" "$new_target"
         error "恢复停用状态失败，已恢复为启用配置。"
@@ -2222,6 +2236,7 @@ delete_conf() {
     reload_nginx_safe
     ${SUDO} rm -f "$backup"
     info "已删除：${file}"
+    domain_only_rebuild_if_enabled || true
   else
     ${SUDO} cp -a "$backup" "$target"
     ${SUDO} rm -f "$backup"
@@ -2261,6 +2276,7 @@ edit_conf_manual() {
     reload_nginx_safe
     ${SUDO} rm -f "$backup"
     info "配置已编辑并生效：${file}"
+    domain_only_rebuild_if_enabled || true
   else
     ${SUDO} cp -a "$backup" "$target"
     ${SUDO} rm -f "$backup"
@@ -2362,7 +2378,7 @@ _scan_unmanaged_confs() {
       grep -q '^# managed_by=Nginx-X$' "$conf" 2>/dev/null && continue
       # 跳过 nginx 默认/状态配置
       local base; base="$(basename "$conf")"
-      [[ "$base" == default || "$base" == default.conf || "$base" == default.conf.* || "$base" == nginx_status.conf ]] && continue
+      [[ "$base" == default || "$base" == default.conf || "$base" == default.conf.* || "$base" == nginx_status.conf || "$base" == 00-nx-domain-only.conf ]] && continue
       # 通过 realpath 去重（sites-enabled 软链接 → sites-available）
       real_path="$(realpath "$conf" 2>/dev/null || echo "$conf")"
       [[ -n "${seen[$real_path]:-}" ]] && continue
@@ -2597,6 +2613,7 @@ import_existing_confs() {
     # 验证整体配置
     if ${SUDO} nginx -t 2>&1; then
       reload_nginx_safe
+      domain_only_rebuild_if_enabled || true
     else
       warn "导入后 nginx -t 测试未通过，请检查配置。"
     fi
@@ -2722,6 +2739,7 @@ config_entry_menu() {
     echo "3) 配置列表"
     echo "4) 导入已有配置"
     echo "5) 系统DNS设置"
+    echo "6) 仅域名访问（隐藏IP）"
     echo "0) 返回上一级"
     echo "=============================="
     read -rp "请选择: " c
@@ -2732,8 +2750,9 @@ config_entry_menu() {
       3) config_manage_menu ;;
       4) run_menu_action import_existing_confs; pause ;;
       5) dns_setup_menu ;;
+      6) domain_only_menu ;;
       0) return 0 ;;
-      *) warn "无效输入。请输入 0-5 之间的菜单编号。"; pause ;;
+      *) warn "无效输入。请输入 0-6 之间的菜单编号。"; pause ;;
     esac
   done
 }
@@ -4254,6 +4273,360 @@ EOF
   return 1
 }
 
+# ---------- 仅域名访问（隐藏IP） ----------
+DOMAIN_ONLY_IN_SYNC=0
+
+domain_only_conf_path() {
+  echo "${CONF_DIR}/00-nx-domain-only.conf"
+}
+
+domain_only_state_is_enabled() {
+  DOMAIN_ONLY=0
+  if [[ ! -f "$DOMAIN_ONLY_STATE" ]]; then
+    return 1
+  fi
+  # shellcheck disable=SC1090
+  . "$DOMAIN_ONLY_STATE"
+  [[ "${DOMAIN_ONLY:-0}" == "1" ]]
+}
+
+nginx_supports_ssl_reject_handshake() {
+  local v
+  v="$(nginx_local_version)"
+  if [[ -z "$v" ]]; then
+    return 1
+  fi
+  version_gt "$v" "1.19.3"
+}
+
+# 收集受管配置的监听端口，输出 "plain <port>" 或 "ssl <port>"。
+# 只统计通配 listen（如 listen 80; / listen [::]:443 ssl;），
+# 绑定到具体地址的 listen（如 127.0.0.1:8088）不参与拦截。
+domain_only_collect_ports() {
+  local f line p flags
+  while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+    # 按指令匹配（兼容单行/多行 server 块），忽略绑定具体地址的 listen
+    while IFS= read -r line; do
+      p="$(printf '%s\n' "$line" | sed -nE 's/^listen[[:space:]]+(\[[^]]*\]:)?([0-9]+)([[:space:]][^;]*)?;$/\2/p')"
+      [[ -n "$p" ]] || continue
+      flags="$(printf '%s\n' "$line" | sed -nE 's/^listen[[:space:]]+(\[[^]]*\]:)?([0-9]+)([[:space:]][^;]*)?;$/\3/p')"
+      if [[ "$flags" == *ssl* ]]; then
+        echo "ssl ${p}"
+      else
+        echo "plain ${p}"
+      fi
+    done < <(grep -hoE 'listen[[:space:]]+[^;]+;' "$f" 2>/dev/null || true)
+  done < <(list_managed_conf_files)
+}
+
+# 找出 catch-all 之外已声明 default_server 的端口
+domain_only_taken_ports() {
+  local f base
+  for f in "${CONF_DIR}"/*.conf; do
+    [[ -f "$f" ]] || continue
+    base="$(basename "$f")"
+    [[ "$base" == "00-nx-domain-only.conf" ]] && continue
+    grep -hoE 'listen[[:space:]]+(\[[^]]*\]:)?[0-9]+[^;]*default_server[^;]*;' "$f" 2>/dev/null \
+      | sed -nE 's/^listen[[:space:]]+(\[[^]]*\]:)?([0-9]+)[^;]*;$/\2/p' || true
+  done | sort -un
+}
+
+domain_only_ensure_placeholder_cert() {
+  local cert_dir="${SSL_DIR}/nx-domain-only"
+  if [[ -f "$cert_dir/fullchain.pem" && -f "$cert_dir/privkey.pem" ]]; then
+    return 0
+  fi
+  if ! check_cmd openssl; then
+    error "未检测到 openssl，无法生成自签占位证书。"
+    return 1
+  fi
+  ${SUDO} mkdir -p "$cert_dir"
+  local tmp_key tmp_crt
+  tmp_key="$(mktemp /tmp/nginxx-tlskey-XXXXXX)"
+  tmp_crt="$(mktemp /tmp/nginxx-tlscrt-XXXXXX)"
+  if ! openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+      -subj '/CN=nx-domain-only' \
+      -keyout "$tmp_key" -out "$tmp_crt" >/dev/null 2>&1; then
+    rm -f "$tmp_key" "$tmp_crt"
+    error "生成自签占位证书失败。"
+    return 1
+  fi
+  install_managed_file "$tmp_crt" "$cert_dir/fullchain.pem"
+  ${SUDO} install -m 0600 "$tmp_key" "$cert_dir/privkey.pem"
+  rm -f "$tmp_key" "$tmp_crt"
+  info "已生成自签占位证书：${cert_dir}/"
+}
+
+domain_only_emit_cert_lines() {
+  echo "    ssl_certificate     ${SSL_DIR}/nx-domain-only/fullchain.pem;"
+  echo "    ssl_certificate_key ${SSL_DIR}/nx-domain-only/privkey.pem;"
+}
+
+# 生成 catch-all 配置（形态已用真实 nginx 验证）：
+#   - 纯 HTTP 端口  → plain default_server 块（return 444）
+#   - 纯 HTTPS 端口 → ssl default_server 块（nginx>=1.19.4 用 ssl_reject_handshake 拒绝握手，否则配占位证书）
+#   - 混合端口（同端口既有 HTTP 又有 HTTPS 站点）→ ssl default_server 块 + 占位证书，
+#     同一 socket 的默认服务一并接管（HTTP 与 TLS 的未匹配请求都会命中本块）
+build_domain_only_conf() {
+  local out="$1"
+
+  local -A has_plain=() has_ssl=()
+  local -a all_ports=()
+  local kind p
+  while read -r kind p; do
+    [[ -z "$kind" || -z "$p" ]] && continue
+    if [[ "$kind" == "ssl" ]]; then
+      has_ssl["$p"]=1
+    else
+      has_plain["$p"]=1
+    fi
+    all_ports+=("$p")
+  done < <(domain_only_collect_ports)
+
+  if (( ${#has_plain[@]} == 0 && ${#has_ssl[@]} == 0 )); then
+    warn "没有检测到可用的 Nginx 监听端口，请先在 [配置管理] 创建站点配置。"
+    return 1
+  fi
+
+  local -A taken=() classified=()
+  local tp
+  while IFS= read -r tp; do
+    if [[ -n "$tp" ]]; then
+      taken["$tp"]=1
+    fi
+  done < <(domain_only_taken_ports)
+
+  local -a plain_ports=() ssl_ports=() mixed_ports=()
+  for p in "${all_ports[@]}"; do
+    if [[ -n "${classified[$p]:-}" ]]; then
+      continue
+    fi
+    classified["$p"]=1
+    if [[ -n "${taken[$p]:-}" ]]; then
+      warn "端口 ${p} 已存在 default_server 配置，跳过该端口的 IP 拦截。"
+      continue
+    fi
+    if [[ -n "${has_plain[$p]:-}" && -n "${has_ssl[$p]:-}" ]]; then
+      mixed_ports+=("$p")
+    elif [[ -n "${has_ssl[$p]:-}" ]]; then
+      ssl_ports+=("$p")
+    else
+      plain_ports+=("$p")
+    fi
+  done
+
+  if (( ${#plain_ports[@]} == 0 && ${#ssl_ports[@]} == 0 && ${#mixed_ports[@]} == 0 )); then
+    warn "所有监听端口均已有 default_server，未生成仅域名访问配置。"
+    return 1
+  fi
+
+  local reject_supported=0
+  if nginx_supports_ssl_reject_handshake; then
+    reject_supported=1
+  fi
+
+  local need_cert=0
+  if (( ${#mixed_ports[@]} > 0 )); then
+    need_cert=1
+  fi
+  if (( ${#ssl_ports[@]} > 0 && reject_supported == 0 )); then
+    need_cert=1
+  fi
+  if (( need_cert == 1 )); then
+    domain_only_ensure_placeholder_cert || return 1
+  fi
+
+  local -a sorted_plain=() sorted_ssl=() sorted_mixed=()
+  if (( ${#plain_ports[@]} > 0 )); then
+    mapfile -t sorted_plain < <(printf '%s\n' "${plain_ports[@]}" | sort -n)
+  fi
+  if (( ${#ssl_ports[@]} > 0 )); then
+    mapfile -t sorted_ssl < <(printf '%s\n' "${ssl_ports[@]}" | sort -n)
+  fi
+  if (( ${#mixed_ports[@]} > 0 )); then
+    mapfile -t sorted_mixed < <(printf '%s\n' "${mixed_ports[@]}" | sort -n)
+  fi
+
+  {
+    echo "# managed_by=Nginx-X"
+    echo "# domain-only=1"
+    echo ""
+    echo "# 仅域名访问（隐藏IP）：拒绝所有未匹配已配置域名的访问（含 IP 直连）"
+    if (( ${#sorted_plain[@]} > 0 )); then
+      echo "server {"
+      for p in ${sorted_plain[@]+"${sorted_plain[@]}"}; do
+        echo "    listen ${p} default_server;"
+        nginx_listen_ipv6_line "$p" "default_server"
+      done
+      echo "    server_name _;"
+      echo "    access_log off;"
+      echo "    location / {"
+      echo "        return 444;"
+      echo "    }"
+      echo "}"
+    fi
+    if (( ${#sorted_ssl[@]} > 0 )); then
+      echo "server {"
+      for p in ${sorted_ssl[@]+"${sorted_ssl[@]}"}; do
+        echo "    listen ${p} ssl default_server;"
+        nginx_listen_ipv6_line "$p" "ssl default_server"
+      done
+      echo "    server_name _;"
+      echo "    access_log off;"
+      if (( reject_supported == 1 )); then
+        echo "    ssl_reject_handshake on;"
+      else
+        domain_only_emit_cert_lines
+      fi
+      echo "    location / {"
+      echo "        return 444;"
+      echo "    }"
+      echo "}"
+    fi
+    if (( ${#sorted_mixed[@]} > 0 )); then
+      echo "server {"
+      for p in ${sorted_mixed[@]+"${sorted_mixed[@]}"}; do
+        echo "    listen ${p} ssl default_server;"
+        nginx_listen_ipv6_line "$p" "ssl default_server"
+      done
+      echo "    server_name _;"
+      echo "    access_log off;"
+      domain_only_emit_cert_lines
+      echo "    location / {"
+      echo "        return 444;"
+      echo "    }"
+      echo "}"
+    fi
+  } > "$out"
+}
+
+domain_only_sync() {
+  require_nginx_installed || return 1
+
+  local target tmp prev rc=0
+  target="$(domain_only_conf_path)"
+
+  tmp="$(mktemp /tmp/nginxx-domain-only-XXXXXX)"
+  if ! build_domain_only_conf "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  prev="$DOMAIN_ONLY_IN_SYNC"
+  DOMAIN_ONLY_IN_SYNC=1
+  if ! apply_conf_with_rollback "$tmp" "$target"; then
+    rc=1
+  fi
+  DOMAIN_ONLY_IN_SYNC="$prev"
+  rm -f "$tmp"
+  return $rc
+}
+
+domain_only_rebuild_if_enabled() {
+  if ! domain_only_state_is_enabled; then
+    return 0
+  fi
+  domain_only_sync || true
+}
+
+domain_only_after_apply() {
+  if (( DOMAIN_ONLY_IN_SYNC == 1 )); then
+    return 0
+  fi
+  domain_only_rebuild_if_enabled || true
+}
+
+domain_only_enable() {
+  require_nginx_installed || return 1
+
+  local target
+  target="$(domain_only_conf_path)"
+
+  if [[ -f "$target" ]] && domain_only_state_is_enabled; then
+    warn "仅域名访问已是开启状态。"
+    return 0
+  fi
+
+  if ! domain_only_sync; then
+    error "开启失败：catch-all 配置未通过校验，已自动回滚。"
+    return 1
+  fi
+
+  ensure_state_dir
+  printf 'DOMAIN_ONLY=1\n' > "$DOMAIN_ONLY_STATE"
+  chmod 600 "$DOMAIN_ONLY_STATE" 2>/dev/null || true
+  info "仅域名访问已开启：Nginx 端口仅接受已配置域名的访问，IP 直连会被直接断开。"
+  warn "SSH 与 Nginx 之外的服务不受影响；站点配置变更时会自动同步拦截端口。"
+}
+
+domain_only_disable() {
+  require_nginx_installed || return 1
+
+  local target backup prev rc=0
+  target="$(domain_only_conf_path)"
+
+  if [[ ! -f "$target" ]]; then
+    warn "仅域名访问已是关闭状态。"
+    ensure_state_dir
+    printf 'DOMAIN_ONLY=0\n' > "$DOMAIN_ONLY_STATE" 2>/dev/null || true
+    return 0
+  fi
+
+  ensure_state_dir
+  backup="$(mktemp /tmp/nginxx-domain-only-bak-XXXXXX)"
+  ${SUDO} cp -a "$target" "$backup"
+
+  prev="$DOMAIN_ONLY_IN_SYNC"
+  DOMAIN_ONLY_IN_SYNC=1
+  ${SUDO} rm -f "$target"
+  if nginx_test && reload_nginx_safe; then
+    rm -f "$backup"
+    printf 'DOMAIN_ONLY=0\n' > "$DOMAIN_ONLY_STATE"
+    chmod 600 "$DOMAIN_ONLY_STATE" 2>/dev/null || true
+    info "仅域名访问已关闭。"
+  else
+    ${SUDO} cp -a "$backup" "$target"
+    rm -f "$backup"
+    error "关闭失败：Nginx 校验未通过，已恢复 catch-all 配置。"
+    ${SUDO} nginx -t || true
+    rc=1
+  fi
+  DOMAIN_ONLY_IN_SYNC="$prev"
+  return $rc
+}
+
+domain_only_menu() {
+  while true; do
+    local enabled=0
+    if domain_only_state_is_enabled; then
+      enabled=1
+    fi
+
+    clear
+    echo "========== 仅域名访问（隐藏IP） =========="
+    if (( enabled == 1 )); then
+      echo "当前状态：已开启（IP 直连访问会被拒绝）"
+    else
+      echo "当前状态：已关闭"
+    fi
+    echo "1) 开启"
+    echo "2) 关闭"
+    echo "0) 返回上一级"
+    echo "========================================="
+    echo "说明：开启后用 IP / 未配置域名访问 Nginx 端口会被直接断开（不返回任何内容），"
+    echo "只能通过已配置的域名访问站点；SSH 与 Nginx 之外的服务不受影响。"
+    read -rp "请选择: " c
+
+    case "$c" in
+      1) run_menu_action domain_only_enable; pause ;;
+      2) run_menu_action domain_only_disable; pause ;;
+      0) return 0 ;;
+      *) warn "无效输入。请输入 0-2 之间的菜单编号。"; pause ;;
+    esac
+  done
+}
+
 cert_menu() {
   require_nginx_installed || {
     pause
@@ -4548,6 +4921,7 @@ uninstall_script_only() {
 
   # 2) 清理脚本目录下运行状态文件
   rm -f "$EMAIL_CONF" 2>/dev/null || true
+  rm -f "$DOMAIN_ONLY_STATE" 2>/dev/null || true
 
   # 3) 给出手动删除路径（仅当不在系统通用 bin 目录），避免误导用户去清理 /usr/local/bin
   local dir_to_remove
@@ -4652,6 +5026,7 @@ uninstall_acme_only() {
   # 3) 清理邮箱及 DNS API 持久化信息
   rm -f "$EMAIL_CONF" 2>/dev/null || true
   rm -f "$DNS_CONF" 2>/dev/null || true
+  rm -f "$DOMAIN_ONLY_STATE" 2>/dev/null || true
 
   info "Acme 及相关配置已清理完成。"
 }
