@@ -5290,15 +5290,12 @@ update_script() {
   ${SUDO} install -m 0755 "${work_dir}/nx.sh" "$target_bin"
   info "脚本已更新到最新版本（${target_bin}）。"
 
-  # 是否立即重启进入新版本（在交互式主菜单中才触发）
+  # 是否自动重启进入新版本（在交互式主菜单中才触发，直接 exec 替换当前进程）
   if [[ "${NX_IN_MENU:-0}" == "1" ]]; then
-    echo
-    if confirm "立即重启 nx 并进入新版本？"; then
-      note "正在重启 nx..."
-      exec "$target_bin"
-    fi
-    note "重新启动 nx 后生效。"
+    note "正在重启 nx 并进入新版本..."
+    exec "$target_bin"
   fi
+  note "重新启动 nx 后生效。"
 }
 
 main_menu() {
