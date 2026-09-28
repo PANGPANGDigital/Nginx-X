@@ -5287,12 +5287,30 @@ update_script() {
   fi
   [[ -z "$target_bin" ]] && target_bin="/usr/local/bin/nx"
 
+  # 对比更新前后内容：无变化则提示已最新并返回菜单，不重启
+  local bin_md5_before=""
+  if [[ -f "$target_bin" ]] && check_cmd md5sum; then
+    bin_md5_before="$(md5sum "$target_bin" 2>/dev/null | awk '{print $1}')"
+  fi
+
   ${SUDO} install -m 0755 "${work_dir}/nx.sh" "$target_bin"
+
+  local bin_md5_after=""
+  if check_cmd md5sum; then
+    bin_md5_after="$(md5sum "$target_bin" 2>/dev/null | awk '{print $1}')"
+  fi
+
+  if [[ -n "$bin_md5_before" && "$bin_md5_before" == "$bin_md5_after" ]]; then
+    info "当前已是最新版本（${target_bin}）。"
+    return 0
+  fi
+
   info "脚本已更新到最新版本（${target_bin}）。"
 
   # 是否自动重启进入新版本（在交互式主菜单中才触发，直接 exec 替换当前进程）
   if [[ "${NX_IN_MENU:-0}" == "1" ]]; then
     note "正在重启 nx 并进入新版本..."
+    sleep 1
     exec "$target_bin"
   fi
   note "重新启动 nx 后生效。"
