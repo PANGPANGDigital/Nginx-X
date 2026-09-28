@@ -4555,6 +4555,102 @@ domain_only_after_apply() {
   domain_only_rebuild_if_enabled || true
 }
 
+# 列出本机对外（非回环）监听、但不属于 Nginx 的端口
+# 用途：仅域名访问功能只拦截 Nginx 自身监听的端口，Docker 直接发布的端口等不受此功能控制；开启时逐一提示，避免误解为“全机隐藏IP”
+domain_only_list_exposed_ports() {
+  local p line addr hex src
+  local -a nginx_ports=()
+
+  # 1) 已管理的站点配置里的监听端口
+  while IFS= read -r _ p; do
+    [[ -n "$p" ]] && nginx_ports+=("$p")
+  done < <(domain_only_collect_ports)
+
+  # 2) nginx 实际生效配置的全部 listen 端口（包含未被本工具接管的配置）
+  if check_cmd nginx; then
+    while IFS= read -r line; do
+      p="$(printf '%s\n' "$line" | sed -nE 's/^[[:space:]]*listen[[:space:]]+(\[[^]]*\]:)?([0-9]+)([[:space:]][^;]*)?;.*$/\2/p')"
+      [[ -n "$p" ]] && nginx_ports+=("$p")
+    done < <(nginx -T 2>/dev/null | grep -E '^[[:space:]]*listen[[:space:]]' || true)
+  fi
+
+  local -A ngx=() seen=()
+  local x
+  for x in ${nginx_ports[@]+"${nginx_ports[@]}"}; do
+    ngx["$x"]=1
+  done
+  ngx["22"]=1   # SSH 不属于本功能范围（菜单说明已声明不受影响）
+
+  # 3) 收集本机所有 TCP 监听端口（回退链与 nginx_port_listening 一致）
+  local -a all_listening=()
+  if check_cmd ss; then
+    while IFS= read -r lp; do
+      case "$lp" in 127.*|'[::1]':*|'::1:'*) continue ;; esac
+      p="${lp##*:}"
+      [[ "$p" =~ ^[0-9]+$ ]] && all_listening+=("$p")
+    done < <(ss -lntH 2>/dev/null | awk 'NR>0 {print $4}')
+  elif check_cmd netstat; then
+    while IFS= read -r lp; do
+      case "$lp" in 127.*|'[::1]':*|'::1:'*) continue ;; esac
+      p="${lp##*:}"
+      [[ "$p" =~ ^[0-9]+$ ]] && all_listening+=("$p")
+    done < <(netstat -lnt 2>/dev/null | awk 'NR>2 {print $4}')
+  else
+    for src in /proc/net/tcp /proc/net/tcp6; do
+      [[ -r "$src" ]] || continue
+      while IFS= read -r pair; do
+        [[ -z "$pair" ]] && continue
+        addr="${pair%%:*}"
+        hex="${pair##*:}"
+        # 只统计通配地址（0.0.0.0 / ::）；绑定具体回环地址的条目已在下方 case 外过滤
+        case "$addr" in
+          00000000|00000000000000000000000000000000) ;;
+          *) continue ;;
+        esac
+        [[ "$hex" =~ ^[0-9A-Fa-f]+$ ]] || continue
+        p=$(( 16#$hex ))
+        all_listening+=("$p")
+      done < <(awk 'NR>1 {print $2}' "$src" 2>/dev/null)
+    done
+  fi
+
+  local -a exposed=()
+  for p in ${all_listening[@]+"${all_listening[@]}"}; do
+    [[ -n "${ngx[$p]:-}" || -n "${seen[$p]:-}" ]] && continue
+    seen["$p"]=1
+    exposed+=("$p")
+  done
+  (( ${#exposed[@]} )) && printf '%s\n' "${exposed[@]}" | sort -n
+  return 0
+}
+
+# 尽力识别端口对应的进程名（ss -p 需要 root；BusyBox ss 不支持则为空）
+domain_only_port_process() {
+  local p="$1"
+  ss -lntpH 2>/dev/null | awk -v port="$p" '$4 ~ ":"port"$"' | head -n1 \
+    | sed -nE 's/.*users:\(\("([^"]+)".*/\1/p'
+}
+
+domain_only_warn_exposed_ports() {
+  local -a exposed=()
+  local x pname
+  while IFS= read -r x; do
+    [[ -n "$x" ]] && exposed+=("$x")
+  done < <(domain_only_list_exposed_ports)
+  (( ${#exposed[@]} )) || return 0
+
+  warn "检测到以下端口由 Nginx 之外的服务直接对外监听，仅域名访问无法拦截它们："
+  for x in ${exposed[@]+"${exposed[@]}"}; do
+    pname="$(domain_only_port_process "$x")"
+    if [[ -n "$pname" ]]; then
+      warn "  端口 ${x}（${pname}）仍可用 IP:端口 访问"
+    else
+      warn "  端口 ${x} 仍可用 IP:端口 访问"
+    fi
+  done
+  warn "如需隐藏这些端口，请在对应服务（如 Docker）中改为仅监听 127.0.0.1，或用防火墙限制来源。"
+}
+
 domain_only_enable() {
   require_nginx_installed || return 1
 
@@ -4574,8 +4670,9 @@ domain_only_enable() {
   ensure_state_dir
   printf 'DOMAIN_ONLY=1\n' > "$DOMAIN_ONLY_STATE"
   chmod 600 "$DOMAIN_ONLY_STATE" 2>/dev/null || true
-  info "仅域名访问已开启：Nginx 端口仅接受已配置域名的访问，IP 直连会被直接断开。"
+  info "仅域名访问已开启：Nginx 监听的端口仅接受已配置域名的访问，IP 直连会被直接断开。"
   warn "SSH 与 Nginx 之外的服务不受影响；站点配置变更时会自动同步拦截端口。"
+  domain_only_warn_exposed_ports
 }
 
 domain_only_disable() {
@@ -4634,6 +4731,7 @@ domain_only_menu() {
     echo "========================================="
     echo "说明：开启后用 IP / 未配置域名访问 Nginx 端口会被直接断开（不返回任何内容），"
     echo "只能通过已配置的域名访问站点；SSH 与 Nginx 之外的服务不受影响。"
+    echo "注意：Docker 等直接对外发布的端口不经过 Nginx，本功能无法拦截（开启时会列出）。"
     read -rp "请选择: " c
 
     case "$c" in
