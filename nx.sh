@@ -5289,7 +5289,16 @@ update_script() {
 
   ${SUDO} install -m 0755 "${work_dir}/nx.sh" "$target_bin"
   info "脚本已更新到最新版本（${target_bin}）。"
-  note "当前运行的仍是旧版本，重新启动 nx 后生效。"
+
+  # 是否立即重启进入新版本（在交互式主菜单中才触发）
+  if [[ "${NX_IN_MENU:-0}" == "1" ]]; then
+    echo
+    if confirm "立即重启 nx 并进入新版本？"; then
+      note "正在重启 nx..."
+      exec "$target_bin"
+    fi
+    note "重新启动 nx 后生效。"
+  fi
 }
 
 main_menu() {
@@ -5318,7 +5327,7 @@ main() {
       3) cert_menu ;;
       4) realtime_info_menu ;;
       5) uninstall_menu ;;
-      6) run_menu_action update_script; pause ;;
+      6) NX_IN_MENU=1 run_menu_action update_script; NX_IN_MENU=0; pause ;;
       0) info "已退出 ${APP_NAME}。"; exit 0 ;;
       *) warn "无效输入，请输入主菜单中的编号（0-6）。"; pause ;;
     esac
