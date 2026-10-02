@@ -9,6 +9,8 @@ CONF_DIR="$T/conf"
 STATE_DIR="$T/state"
 DOMAIN_ONLY_STATE="$STATE_DIR/domain-only.conf"
 SSL_DIR="$T/ssl"
+# Never snapshot or restore the runner's installed nginx.conf in this fixture.
+NGINX_MAIN_CONF="$T/nginx.conf"
 # shellcheck disable=SC2034
 SUDO=""
 mkdir -p "$CONF_DIR" "$STATE_DIR" "$SSL_DIR"
