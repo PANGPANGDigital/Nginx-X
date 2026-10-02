@@ -867,15 +867,164 @@ conf_target_path() {
   echo "${CONF_DIR}/${domain}-${listen_port}.conf"
 }
 
-conf_meta_get() {
-  local conf_file="$1"
-  local key="$2"
-  grep -E "^# ${key}=" "$conf_file" 2>/dev/null | head -n1 | sed "s/^# ${key}=//" || true
+# Shared source-offset parser, embedded so the single-file bundle stays standalone.
+nx_conf_query() {
+  python3 - "$@" <<'PYCONF'
+import sys, re, ipaddress
+operation, filename, *params = sys.argv[1:]
+def fail(message): raise ValueError(message)
+def socket(value):
+    if value.isdigit(): return '0.0.0.0:' + str(int(value))
+    host, number = value.rsplit(':', 1)
+    host = host.strip('[]')
+    host = '0.0.0.0' if host == '*' else str(ipaddress.ip_address(host))
+    if not 1 <= int(number) <= 65535: fail('invalid port')
+    return ('[' + host + ']' if ':' in host else host) + ':' + str(int(number))
+try:
+    text = open(filename, encoding='utf-8').read()
+    tokens = []
+    metadata = {}
+    depth = 0
+    i = 0
+    while i < len(text):
+        if text[i].isspace():
+            i += 1
+            continue
+        if text[i] == '#':
+            end = text.find('\n', i)
+            end = len(text) if end < 0 else end + 1
+            line_start = text.rfind('\n', 0, i) + 1
+            # Setters append metadata after server blocks. Only standalone
+            # top-level comments count, never strings or comments in a block.
+            if depth == 0 and not text[line_start:i].strip():
+                match = re.fullmatch(r'# ([A-Za-z_][A-Za-z_0-9]*)=([^\r\n]*)(?:\r?\n)?', text[i:end])
+                if match:
+                    metadata.setdefault(match[1], []).append((line_start, end, match[2]))
+            i = end
+            continue
+        start = i
+        if text[i] in '{};':
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
+            i += 1
+        else:
+            quote = None
+            while i < len(text):
+                c = text[i]
+                if c == '\\':
+                    i += 2
+                    continue
+                if quote:
+                    if c == quote:
+                        quote = None
+                    i += 1
+                    continue
+                if c in '\"\'':
+                    quote = c
+                    i += 1
+                    continue
+                if text.startswith('${', i):
+                    end = text.find('}', i + 2)
+                    if end < 0:
+                        fail('unterminated variable')
+                    i = end + 1
+                    continue
+                if c.isspace() or c in '{};#':
+                    break
+                i += 1
+            if quote or i > len(text):
+                fail('unterminated quote/escape')
+        tokens.append((text[start:i], start, i))
+
+    cursor = 0
+    def parse(nested=False):
+        global cursor
+        nodes = []
+        while cursor < len(tokens):
+            if tokens[cursor][0] == '}':
+                if not nested:
+                    fail('unexpected closing brace')
+                closing = tokens[cursor][2]
+                cursor += 1
+                return nodes, closing
+            args = []
+            start = tokens[cursor][1]
+            while cursor < len(tokens) and tokens[cursor][0] not in '{};':
+                args.append(tokens[cursor][0])
+                cursor += 1
+            if not args or cursor >= len(tokens):
+                fail('incomplete directive')
+            delimiter, opening, end = tokens[cursor]
+            cursor += 1
+            children = None
+            if delimiter == '{':
+                children, end = parse(True)
+            elif delimiter != ';':
+                fail('missing semicolon')
+            nodes.append(dict(args=args, start=start, end=end, opening=opening, children=children))
+        if nested:
+            fail('unclosed block')
+        return nodes, len(text)
+
+    nodes, _ = parse()
+    def walk(nodes):
+        for n in nodes:
+            yield n
+            yield from walk(n['children'] or [])
+    servers = [n for n in nodes if n['args'] == ['server'] and n['children'] is not None]
+    def directives(n, key): return [x for x in n['children'] if x['args'][0] == key]
+    def unquote(s): return s[1:-1] if len(s)>1 and s[0] == s[-1] and s[0] in '\"\'' else s
+    rows = []
+    for idx, srv in enumerate(servers):
+        names = [unquote(x) for n in directives(srv, 'server_name') for x in n['args'][1:]]
+        for n in directives(srv, 'listen'):
+            rows.append((idx, socket(n['args'][1]), 'ssl' in n['args'][2:], names))
+    if operation == 'meta':
+        values = metadata.get(params[0], [])
+        if len(values)>1: fail('duplicate metadata: '+params[0])
+        print(values[0][2] if values else '')
+    elif operation == 'count': print(len(servers))
+    elif operation == 'locations': print(sum(n['args'][0]=='location' for n in walk(nodes)))
+    elif operation == 'proxy':
+        print(next((unquote(n['args'][1]) for n in walk(nodes) if n['args'][0]=='proxy_pass'), ''))
+    elif operation == 'keys':
+        print('\n'.join(sorted({name.lower().rstrip('.')+'|'+sock for _,sock,_,names in rows for name in names})))
+    elif operation == 'summary':
+        if not rows: fail('no explicit listeners')
+        row = next((r for r in rows if r[2]), rows[0])
+        if not row[3]: fail('no server_name')
+        domain=row[3][0]
+        if not re.fullmatch(r'[A-Za-z0-9_.-]+',domain) or domain in ('_', 'localhost'): fail('unsupported primary server_name')
+        backend=next((unquote(n['args'][1]) for n in walk(servers[row[0]]['children']) if n['args'][0]=='proxy_pass'), '')
+        if any(c in backend for c in '|\n\r'): fail('unsupported proxy_pass')
+        mode='external' if backend and not re.match(r'https?://(?:127\.0\.0\.1|localhost)(?=[:/]|$)',backend) else ''
+        print('|'.join([domain,row[1].rsplit(':',1)[1],backend,str(row[2]).lower(),mode]))
+    elif operation == 'defaults':
+        old = params[0].split(',') if params[0] else []
+        oldrows = params[1].splitlines()
+        newrows = params[2].splitlines()
+        def listeners(lines):
+            return [(p[1],p[2],p[0]) for p in (line.split('|') for line in lines) if len(p)>2]
+        before, after = listeners(oldrows), listeners(newrows)
+        mapping={}
+        for a,b in zip(before,after):
+            if a[1:]==b[1:]: mapping[a[0]]=b[0]
+        result=[]
+        for s in old:
+            s=socket(s); s=mapping.get(s,s)
+            if s in {r[0] for r in after} and s not in result: result.append(s)
+        print(','.join(result))
+    else: fail('unknown query')
+except (ValueError, OSError, UnicodeError, IndexError) as exc:
+    print('Config inspection refused: '+str(exc), file=sys.stderr)
+    sys.exit(1)
+PYCONF
 }
 
-extract_proxy_pass() {
-  sed -nE 's/^[[:space:]]*proxy_pass[[:space:]]+([^;]+);.*/\1/p' "$1" 2>/dev/null | head -n1
-}
+conf_meta_get() { nx_conf_query meta "$1" "$2"; }
+extract_proxy_pass() { nx_conf_query proxy "$1"; }
 
 url_explicit_port() {
   printf '%s\n' "$1" | sed -nE 's#^https?://(\[[^]]+\]|[^/:]+):([0-9]+)(/.*)?$#\2#p'
@@ -910,8 +1059,7 @@ mark_conf_manual_edited() {
 }
 
 conf_server_block_count() {
-  local conf_file="$1"
-  grep -cE '^[[:space:]]*server[[:space:]]*\{' "$conf_file" 2>/dev/null || true
+  nx_conf_query count "$1"
 }
 
 conf_has_custom_locations() {
@@ -1181,6 +1329,8 @@ add_reverse_proxy() {
     return 1
   fi
 
+  nx_assert_new_target "$(conf_target_path "$domain" "$listen_port")" || return 1
+
   desired_port="$listen_port"
   create_port="$listen_port"
 
@@ -1219,7 +1369,7 @@ add_reverse_proxy() {
   trap 'rm -f "${tmp:-}"' RETURN
 
   build_proxy_conf "$domain" "$create_port" "$backend_port" "$tmp"
-  if apply_conf_with_rollback "$tmp" "$target"; then
+  if nx_transaction nx_add_conf "$tmp" "$target"; then
     info "反向代理配置已生效：${target}"
 
     if [[ "$force_enable_https" == "1" ]]; then
@@ -1292,6 +1442,8 @@ add_external_url_proxy() {
     return 1
   fi
 
+  nx_assert_new_target "$(conf_target_path "$domain" "$listen_port")" || return 1
+
   desired_port="$listen_port"
   create_port="$listen_port"
 
@@ -1356,7 +1508,7 @@ add_external_url_proxy() {
   trap 'rm -f "${tmp:-}"' RETURN
 
   build_external_proxy_conf "$domain" "$create_port" "$upstream_url" "$external_mode" "$tmp" "0" "$stream_upstream_url" "$source_site_url" "$referer_url" "$stream_upstream_urls"
-  if apply_conf_with_rollback "$tmp" "$target"; then
+  if nx_transaction nx_add_conf "$tmp" "$target"; then
     info "外部反代配置已生效：${target}"
 
     if [[ "$force_enable_https" == "1" ]]; then
@@ -1495,7 +1647,7 @@ modify_conf() {
   local new_domain new_listen new_backend tmp new_target
 
   current_domain="$(extract_domain_from_conf "$src")"
-  current_listen="$(conf_meta_get "$src" listen_port)"
+  current_listen="$(_extract_conf_meta "$src" | cut -d '|' -f2)"
   current_backend="$(conf_meta_get "$src" backend_port)"
   [[ -z "$current_listen" ]] && current_listen="80"
   # 元数据缺失时从实际 proxy_pass 提取后端端口
@@ -1539,70 +1691,22 @@ modify_conf() {
 
   tmp="$(mktemp /tmp/nginxx-mod-"${new_domain}"-XXXXXX)"
   trap 'rm -f "${tmp:-}"' RETURN
-  build_proxy_conf "$new_domain" "$new_listen" "$new_backend" "$tmp"
-
-  # 修改后默认写入 .conf；也可选择立即停用
+  build_proxy_conf "$new_domain" "$new_listen" "$new_backend" "$tmp" || return 1
+  nx_preserve_modify_tls "$src" "$tmp" "$new_domain" "$new_listen" || return 1
   new_target="$(conf_target_path "$new_domain" "$new_listen")"
   [[ "$src" == *.conf.bak ]] && new_target="${new_target}.bak"
-  if apply_conf_with_rollback "$tmp" "$new_target" "$src"; then
-
-    if [[ "$new_target" == *.bak ]]; then
-      info "配置已修改，保持停用状态。"
-      rm -f "$tmp"
-      return 0
-    fi
-    info "配置已修改并生效。"
-
-    if ! confirm "是否立即启用该配置？"; then
-      disable_conf "$(basename "$new_target")" || { rm -f "$tmp"; return 1; }
-      rm -f "$tmp"
-      return 0
-    fi
-
-    # 统一 HTTPS 启用流程（与 add_reverse_proxy 一致）
-    if valid_ipv4_host "$new_domain"; then
-      warn "当前使用的是 IP，证书自动申请通常不适用，已跳过证书流程。"
-    elif [[ -f "${SSL_DIR}/${new_domain}/fullchain.pem" && -f "${SSL_DIR}/${new_domain}/privkey.pem" ]]; then
-      if confirm "检测到已有证书，是否立即启用 HTTPS（强制跳转）？"; then
-        if enable_https_for_conf_file "$new_domain" "$new_target" "$new_listen"; then
-          info "已完成：配置修改 + HTTPS 启用。"
-        else
-          warn "启用 HTTPS 失败。请检查证书、监听端口占用情况，以及 nginx -t 输出后重试。"
-        fi
-      fi
-    else
-      if confirm "是否立即自动申请证书并启用 HTTPS？"; then
-        if ! ensure_email_interactive; then
-          warn "邮箱未设置成功，已跳过自动证书流程。"
-        else
-          local selected_cert_mode
-          selected_cert_mode="$(select_cert_mode_interactive)"
-          if issue_cert_for_domain "$new_domain" "$selected_cert_mode"; then
-            if enable_https_for_conf_file "$new_domain" "$new_target" "$new_listen"; then
-              info "已完成：配置修改 + 证书 + HTTPS 启用。"
-            else
-              warn "证书已申请成功，但启用 HTTPS 失败。请检查监听端口占用和 nginx -t 输出。"
-            fi
-          else
-            warn "证书申请失败。请检查域名解析、端口放行或 DNS API 配置。"
-          fi
-        fi
-      fi
-    fi
-  else
-    rm -f "$tmp"
-    return 1
-  fi
-
+  apply_conf_with_rollback "$tmp" "$new_target" "$src" || return 1
+  info "配置已修改，保留原协议与启停状态。"
   rm -f "$tmp"
+
 }
 
 modify_external_conf() {
   local file src current_domain current_listen current_upstream_url current_mode
   local current_stream_upstream_url current_stream_upstream_urls current_source_site_url current_referer_url
   local new_domain new_listen new_upstream_url new_mode new_stream_upstream_url new_stream_upstream_urls new_source_site_url new_referer_url
-  local tmp new_target desired_port create_port force_enable_https="0"
-  local was_https_enabled=0 was_disabled=0 domain_changed=0
+  local tmp new_target
+  local was_disabled=0
 
   file="${1:-}"
   src="${CONF_DIR}/${file}"
@@ -1614,7 +1718,7 @@ modify_external_conf() {
   require_template_rebuild_safe "$src" "修改外部反代配置" || return 1
 
   current_domain="$(extract_domain_from_conf "$src")"
-  current_listen="$(conf_meta_get "$src" listen_port)"
+  current_listen="$(_extract_conf_meta "$src" | cut -d '|' -f2)"
   current_upstream_url="$(conf_meta_get "$src" upstream_url)"
   current_mode="$(conf_meta_get "$src" external_mode)"
   current_stream_upstream_url="$(conf_meta_get "$src" stream_upstream_url)"
@@ -1627,7 +1731,6 @@ modify_external_conf() {
   [[ -z "$current_source_site_url" ]] && current_source_site_url="$current_upstream_url"
   [[ -z "$current_referer_url" && -n "$current_source_site_url" ]] && current_referer_url="$(default_referer_from_url "$current_source_site_url")"
 
-  conf_https_enabled "$src" && was_https_enabled=1
   [[ ! "$file" =~ \.conf$ ]] && was_disabled=1
 
   read -rp "新的域名（当前 ${current_domain}）: " new_domain
@@ -1699,79 +1802,16 @@ modify_external_conf() {
     new_referer_url=""
   fi
 
-  desired_port="$new_listen"
-  create_port="$new_listen"
-  [[ "$new_domain" != "$current_domain" ]] && domain_changed=1
-
-  if is_port_used_os "$new_listen"; then
-    warn "监听端口 ${new_listen} 当前已被占用。"
-    if ! confirm "是否继续写入配置并交由 nginx -t 校验？"; then
-      info "已取消修改。"
-      return 0
-    fi
-
-    if [[ "$new_listen" == "443" ]] && [[ ! -f "${SSL_DIR}/${new_domain}/fullchain.pem" || ! -f "${SSL_DIR}/${new_domain}/privkey.pem" ]]; then
-      warn "检测到 443 端口复用且新域名暂无证书，已自动改为先使用 80 端口创建配置。"
-      create_port="80"
-    fi
-
-    if port_has_ssl_listener "$desired_port"; then
-      if [[ -f "${SSL_DIR}/${new_domain}/fullchain.pem" && -f "${SSL_DIR}/${new_domain}/privkey.pem" ]]; then
-        warn "检测到端口 ${desired_port} 已用于 HTTPS，且新域名已有证书。"
-        warn "将先写入临时 HTTP 配置，再自动切换为 ${desired_port} HTTPS。"
-        create_port="80"
-        force_enable_https="1"
-      else
-        warn "检测到端口 ${desired_port} 已用于 HTTPS，但新域名暂无证书。"
-        warn "已自动改为先使用 80 端口创建配置。"
-        create_port="80"
-      fi
-    fi
-  fi
-
-  new_target="$(conf_target_path "$new_domain" "$desired_port")"
+  new_target="$(conf_target_path "$new_domain" "$new_listen")"
   (( was_disabled == 0 )) || new_target="${new_target}.bak"
-  tmp="$(mktemp /tmp/nginxx-external-mod-"${new_domain}"-XXXXXX)"
+  tmp="$(mktemp /tmp/nginxx-external-mod-XXXXXX)" || return 1
   trap 'rm -f "${tmp:-}"' RETURN
-  build_external_proxy_conf "$new_domain" "$create_port" "$new_upstream_url" "$new_mode" "$tmp" "0" "$new_stream_upstream_url" "$new_source_site_url" "$new_referer_url" "$new_stream_upstream_urls"
-
-  if apply_conf_with_rollback "$tmp" "$new_target" "$src"; then
-    if (( was_disabled == 1 )); then
-      info "配置已修改，保持停用状态。"
-      rm -f "$tmp"
-      return 0
-    fi
-
-    if [[ "$force_enable_https" == "1" || "$was_https_enabled" == "1" ]]; then
-      if [[ ! -f "${SSL_DIR}/${new_domain}/fullchain.pem" || ! -f "${SSL_DIR}/${new_domain}/privkey.pem" ]]; then
-        if ! ensure_cert_for_domain_interactive "$new_domain"; then
-          warn "新域名证书申请未完成，当前保留为 HTTP 配置。"
-        elif enable_https_for_conf_file "$new_domain" "$new_target" "$desired_port"; then
-          info "已完成：修改配置并重新启用 HTTPS。"
-        else
-          warn "证书已就绪，但重新启用 HTTPS 失败。请检查监听端口占用和 nginx -t 输出。"
-        fi
-      elif enable_https_for_conf_file "$new_domain" "$new_target" "$desired_port"; then
-        info "已完成：修改配置并重新启用 HTTPS。"
-      else
-        warn "修改成功，但重新启用 HTTPS 失败。当前配置可能仍是 HTTP，请检查 nginx -t 输出后再试。"
-      fi
-    elif (( domain_changed == 1 )) && ! valid_ipv4_host "$new_domain" && [[ ! -f "${SSL_DIR}/${new_domain}/fullchain.pem" || ! -f "${SSL_DIR}/${new_domain}/privkey.pem" ]]; then
-      if confirm "检测到更换了域名且新域名暂无证书，是否立即申请并启用 HTTPS？"; then
-        if ensure_cert_for_domain_interactive "$new_domain" && enable_https_for_conf_file "$new_domain" "$new_target" "$desired_port"; then
-          info "已完成：修改配置、新域名证书申请与 HTTPS 启用。"
-        else
-          warn "新域名证书申请或 HTTPS 启用失败，当前保留 HTTP 配置。"
-        fi
-      fi
-    fi
-
-  else
-    rm -f "$tmp"
-    return 1
-  fi
-
+  build_external_proxy_conf "$new_domain" "$new_listen" "$new_upstream_url" "$new_mode" "$tmp" "0" "$new_stream_upstream_url" "$new_source_site_url" "$new_referer_url" "$new_stream_upstream_urls" || return 1
+  nx_preserve_modify_tls "$src" "$tmp" "$new_domain" "$new_listen" || return 1
+  apply_conf_with_rollback "$tmp" "$new_target" "$src" || return 1
+  info "配置已修改，保留原协议与启停状态。"
   rm -f "$tmp"
+
 }
 
 config_file_action_menu() {
@@ -1846,13 +1886,12 @@ _scan_unmanaged_confs() {
   local -A seen
   # 预建已纳管域名-端口索引（含停用的 .bak 等），用于去重
   local -A managed_index
-  local _f _d _p
+  local _f key keys
   for _f in "${CONF_DIR}"/*.conf "${CONF_DIR}"/*.conf.*; do
     [[ -f "$_f" ]] || continue
     grep -q '^# managed_by=Nginx-X$' "$_f" 2>/dev/null || continue
-    _d="$(conf_meta_get "$_f" domain)"
-    _p="$(conf_meta_get "$_f" listen_port)"
-    [[ -n "$_d" ]] && managed_index["${_d}|${_p:-80}"]=1
+    keys="$(nx_conf_query keys "$_f")" || continue
+    while IFS= read -r key; do [[ -z "$key" ]] || managed_index["$key"]=1; done <<< "$keys"
   done
 
   local dirs=(
@@ -1878,18 +1917,12 @@ _scan_unmanaged_confs() {
       [[ -n "${seen[$real_path]:-}" ]] && continue
       seen["$real_path"]="$conf"
       # 检查是否已有同域名-端口的纳管配置（包括停用的）
-      local _cd _cp
-      _cd="$(awk '/^[[:space:]]*server[[:space:]]*\{/{s=1} s && /server_name/{gsub(/;/,""); print $2; exit}' "$conf")"
-      _cp="$(awk '/^[[:space:]]*server[[:space:]]*\{/{s=1} s && /^[[:space:]]*listen[[:space:]]/{gsub(/;/,""); for(i=2;i<=NF;i++){if($i~/^[0-9]+$/){print $i; exit}}}' "$conf")"
-      [[ -z "$_cp" ]] && _cp="80"
-      [[ -n "$_cd" && -n "${managed_index["${_cd}|${_cp}"]:-}" ]] && continue
-      # 对 sites-available/sites-enabled 的文件，额外检查 conf.d 是否已存在同名纳管配置
-      if [[ "$dir" != "$CONF_DIR" ]]; then
-        local _candidate="${CONF_DIR}/${_cd}-${_cp}.conf"
-        if [[ -f "$_candidate" ]] && grep -q '^# managed_by=Nginx-X$' "$_candidate" 2>/dev/null; then
-          continue
-        fi
-      fi
+      local duplicate=0
+      keys="$(nx_conf_query keys "$conf")" || continue
+      while IFS= read -r key; do
+        if [[ -n "$key" && -n "${managed_index[$key]:-}" ]]; then duplicate=1; fi
+      done <<< "$keys"
+      (( duplicate == 0 )) || continue
       echo "$conf"
     done
   done
@@ -1897,31 +1930,7 @@ _scan_unmanaged_confs() {
 
 # 从现有 conf 中提取元数据
 _extract_conf_meta() {
-  local conf="$1"
-  local domain listen_port backend_url https_enabled="false" mode=""
-
-  # 提取 server_name（取第一个 server 块里的第一个 token）
-  domain="$(awk '/^[[:space:]]*server[[:space:]]*\{/{in_srv=1} in_srv && /server_name/{gsub(/;/,""); print $2; exit}' "$conf")"
-  [[ -z "$domain" || "$domain" == "_" || "$domain" == "localhost" ]] && domain=""
-
-  # 提取 listen 端口（优先取带 ssl 的，否则第一个数字）
-  listen_port="$(awk '/^[[:space:]]*server[[:space:]]*\{/{in_srv=1} in_srv && /^[[:space:]]*listen[[:space:]]/{gsub(/;/,""); for(i=2;i<=NF;i++){if($i~/^[0-9]+$/){print $i; exit}}}' "$conf")"
-  [[ -z "$listen_port" ]] && listen_port="80"
-
-  # 提取 proxy_pass
-  backend_url="$(extract_proxy_pass "$conf")"
-
-  # 检测 HTTPS
-  if grep -qE '^[[:space:]]*ssl_certificate[[:space:]]+' "$conf" 2>/dev/null; then
-    https_enabled="true"
-  fi
-
-  # 检测是否为外部反代（proxy_pass 不是 127.0.0.1/localhost）
-  if [[ -n "$backend_url" ]] && ! echo "$backend_url" | grep -qE '127\.0\.0\.1|localhost'; then
-    mode="external"
-  fi
-
-  echo "$domain|$listen_port|$backend_url|$https_enabled|$mode"
+  nx_conf_query summary "$1"
 }
 
 validate_importable_conf() {
@@ -1936,7 +1945,7 @@ validate_importable_conf() {
     return 1
   fi
 
-  locations="$(grep -cE '^[[:space:]]*location[[:space:]]+' "$conf" 2>/dev/null || true)"
+  locations="$(nx_conf_query locations "$conf")" || return 1
   [[ -z "$locations" ]] && locations=0
   if (( locations > 2 )); then
     warn "跳过 ${conf}：检测到多个 location，可能包含自定义业务规则。"
@@ -1952,9 +1961,8 @@ import_single_conf() {
   local meta domain listen_port backend_url https_enabled mode
   local target_name target_path tmp
   local real_conf
-  local -a removed_links=()
 
-  meta="$(_extract_conf_meta "$conf")"
+  meta="$(_extract_conf_meta "$conf")" || return 1
   IFS='|' read -r domain listen_port backend_url https_enabled mode <<< "$meta"
 
   validate_importable_conf "$conf" || return 1
@@ -1967,6 +1975,7 @@ import_single_conf() {
   # 目标文件名
   target_name="${domain}-${listen_port}.conf"
   target_path="${CONF_DIR}/${target_name}"
+  [[ ! -e "$target_path.bak" ]] || { error "同名停用站点已存在。"; return 1; }
 
   # 构建元数据头
   local meta_header
@@ -2019,17 +2028,17 @@ import_single_conf() {
       [[ -L "$enabled_link" ]] || continue
       link_target="$(realpath "$enabled_link" 2>/dev/null || true)"
       if [[ "$link_target" == "$real_conf" ]]; then
-        ${SUDO} rm -f "$enabled_link" || { rm -f "$tmp"; return 1; }
-        removed_links+=("$enabled_link")
+        rm -f "$tmp"
+        error "该配置通过事务目录外的 sites-enabled 链接启用；请先手动迁移到 ${CONF_DIR} 后导入。"
+        return 1
       fi
     done
     if ! apply_conf_with_rollback "$tmp" "$target_path"; then
-      for enabled_link in "${removed_links[@]}"; do ${SUDO} ln -s "$real_conf" "$enabled_link" || true; done
       reload_nginx_safe >/dev/null 2>&1 || true
       rm -f "$tmp"
       return 1
     fi
-    note "原始文件保留在：${real_conf}（已解除 sites-enabled 重复链接）"
+    note "原始文件保留在：${real_conf}（未修改外部启用链接）"
   fi
 
   rm -f "$tmp"
@@ -2052,7 +2061,7 @@ import_existing_confs() {
 
   local conf meta domain listen_port rest imported=0
   for conf in "${unmanaged[@]}"; do
-    meta="$(_extract_conf_meta "$conf")"
+    meta="$(_extract_conf_meta "$conf")" || return 1
     IFS='|' read -r domain listen_port rest <<< "$meta"
     [[ -z "$domain" ]] && domain="(无法识别)"
 
@@ -2213,19 +2222,16 @@ config_entry_menu() {
 
 # --- DNS-01 配置 ---
 extract_domain_from_conf() {
-  local conf_file="$1"
-  local d
-  d="$(grep -E '^# domain=' "$conf_file" 2>/dev/null | head -n1 | sed 's/^# domain=//')"
-  if [[ -z "$d" ]]; then
-    # 回退：用文件名去掉 -端口.conf
-    d="$(basename "$conf_file" | sed -E 's/-[0-9]+\.conf$//; s/\.conf$//')"
-  fi
-  echo "$d"
+  local meta
+  meta="$(nx_conf_query summary "$1")" || return 1
+  printf '%s\n' "${meta%%|*}"
 }
 
 conf_https_enabled() {
-  local conf_file="$1"
-  grep -q '^# https_enabled=true' "$conf_file" 2>/dev/null || grep -qE 'listen[[:space:]]+[^;[:space:]]+[[:space:]]+([^;]*[[:space:]])?ssl([[:space:]]|;)'  "$conf_file" 2>/dev/null
+  local meta tls
+  meta="$(nx_conf_query summary "$1")" || return 1
+  IFS='|' read -r _ _ _ tls _ <<< "$meta"
+  [[ "$tls" == true ]]
 }
 
 health_probe_url() {
@@ -2253,19 +2259,15 @@ health_check_conf_file() {
   local idx prefix
   local status_ok=0
 
-  domain="$(extract_domain_from_conf "$conf_file")"
-  listen_port="$(conf_meta_get "$conf_file" listen_port)"
-  mode="$(conf_meta_get "$conf_file" mode)"
+  [[ "$conf_file" == *.conf ]] || { info "$(basename "$conf_file")：已停用，未执行网络探测。"; return 0; }
+  local actual tls
+  actual="$(_extract_conf_meta "$conf_file")" || return 1
+  IFS='|' read -r domain listen_port _ tls mode <<< "$actual"
   upstream_url="$(conf_meta_get "$conf_file" upstream_url)"
   stream_upstream_url="$(conf_meta_get "$conf_file" stream_upstream_url)"
   stream_upstream_urls="$(conf_meta_get "$conf_file" stream_upstream_urls)"
-  [[ -z "$listen_port" ]] && listen_port="80"
-
-  if conf_https_enabled "$conf_file"; then
-    scheme="https"
-  else
-    scheme="http"
-  fi
+  scheme=http; [[ "$tls" == true ]] && scheme=https
+  note "入口检查通过公共 DNS 访问（可能经过 CDN），不代表本机直连检查。"
 
   if [[ "$listen_port" == "80" && "$scheme" == "http" ]]; then
     target_url="http://${domain}"

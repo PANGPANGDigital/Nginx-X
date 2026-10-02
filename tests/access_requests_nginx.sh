@@ -109,7 +109,7 @@ reload_nginx_safe() {
     fi
     return 1
   fi
-  if [[ "${FAIL_RELOAD_ONCE:-0}" == 1 ]]; then FAIL_RELOAD_ONCE=0; return 1; fi
+  if [[ -f "$TEST_ROOT/fail-reload-once" ]]; then rm "$TEST_ROOT/fail-reload-once"; return 1; fi
   local before
   before="$(cat "/proc/$(cat "$TEST_ROOT/nginx.pid")/task/$(cat "$TEST_ROOT/nginx.pid")/children")"
   "$NGINX_BIN" -p "$TEST_ROOT/" -c "$NGINX_MAIN_CONF" -s reload || return 1
@@ -216,7 +216,7 @@ diff -r "$TEST_ROOT/before-conf" "$CONF_DIR"
 cmp "$TEST_ROOT/before-state" "$DOMAIN_ONLY_STATE"
 http 'validation rollback preserves live default' unknown.test 200 beta
 # Inject the reload failure after real nginx -t, then really reload restored files.
-FAIL_RELOAD_ONCE=1
+: > "$TEST_ROOT/fail-reload-once"
 if domain_only_enable; then echo 'FAIL: injected reload failure accepted' >&2; exit 1; fi
 diff -r "$TEST_ROOT/before-conf" "$CONF_DIR"
 cmp "$TEST_ROOT/before-state" "$DOMAIN_ONLY_STATE"

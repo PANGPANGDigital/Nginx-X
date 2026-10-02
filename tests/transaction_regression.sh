@@ -12,10 +12,10 @@ SSL_DIR="$T/ssl"
 # shellcheck disable=SC2034
 SUDO=""
 mkdir -p "$CONF_DIR" "$STATE_DIR" "$SSL_DIR"
-reloads=0
+printf 0 > "$T/reloads"
 fail_reload=0
 fail_sync=0
-reload_nginx_safe() { reloads=$((reloads+1)); (( fail_reload == 0 )); }
+reload_nginx_safe() { printf '%s\n' "$(( $(cat "$T/reloads") + 1 ))" > "$T/reloads"; (( fail_reload == 0 )); }
 nx_access_sync_files() {
   printf 'derived\n' > "$CONF_DIR/00-nx-domain-only.conf"
   (( fail_sync == 0 ))
@@ -54,11 +54,11 @@ assert_restored
 [[ ! -e "$CONF_DIR/new.conf" ]]
 fail_reload=0
 fail_sync=1
-before="$reloads"
+before="$(cat "$T/reloads")"
 if disable_conf site.conf >/dev/null 2>&1; then echo 'sync error hidden' >&2; exit 1; fi
 assert_restored
 # Only rollback reload occurs; no new configuration is activated before sync.
-[[ "$reloads" == "$((before+1))" ]]
+[[ "$(cat "$T/reloads")" == "$((before+1))" ]]
 fail_sync=0
 disable_conf site.conf >/dev/null
 fail_reload=1

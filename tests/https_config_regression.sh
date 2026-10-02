@@ -177,7 +177,7 @@ if grep -q '^# managed_by=Nginx-X$' "$rollback_import_conf"; then
 fi
 [[ ! -f "$CONF_DIR/rollback.example.com-80.conf" ]]
 
-reload_rollback_target="$TMPDIR_ROOT/reload-rollback.conf"
+reload_rollback_target="$CONF_DIR/reload-rollback.conf"
 reload_rollback_tmp="$TMPDIR_ROOT/reload-rollback.new"
 printf 'original\n' > "$reload_rollback_target"
 printf 'replacement\n' > "$reload_rollback_tmp"
@@ -213,7 +213,7 @@ build_external_proxy_conf \
 [[ "$(grep -c 'proxy_read_timeout' "$stream_conf")" -eq 1 ]]
 [[ "$(grep -c 'proxy_send_timeout' "$stream_conf")" -eq 1 ]]
 
-http_conf="$TMPDIR_ROOT/http-80.conf"
+http_conf="$CONF_DIR/http-80.conf"
 cat > "$http_conf" <<'EOF'
 # managed_by=Nginx-X
 # domain=example.com

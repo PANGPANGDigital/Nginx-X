@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # One mutation, derived access rules, config validation and reload form a unit.
 # Directory-wide snapshots retain modes/owners and include disabled sites.
-nx_transaction() {
-  local snapshot rc=0 state_existed=0
+nx_transaction() (
+  # The lock file lives outside the snapshotted directory. flock releases the
+  # advisory lock on exit, including signal rollback and unexpected termination.
+  local lock_fd
   [[ -n "$CONF_DIR" && "$CONF_DIR" != / && -d "$CONF_DIR" && ! -L "$CONF_DIR" ]] || { error "配置目录必须是明确的普通目录。"; return 1; }
+  command -v flock >/dev/null 2>&1 || { error "事务需要 flock（util-linux）。"; return 1; }
+  exec {lock_fd}>"${CONF_DIR}.nx-lock" || return 1
+  flock -x "$lock_fd" || return 1
+
+  local snapshot rc=0 state_existed=0
   snapshot="$(mktemp -d /tmp/nginxx-transaction-XXXXXX)" || return 1
   if ! ${SUDO} cp -a "$CONF_DIR" "$snapshot/conf"; then
     rm -rf "$snapshot"
@@ -16,37 +23,45 @@ nx_transaction() {
       return 1
     fi
   fi
+  nx_transaction_restore() {
+    error "配置应用失败，正在恢复本次操作前的配置与访问策略。"
+    # Only this configured directory is restored; never touch nginx system paths.
+    local path
+    for path in "$CONF_DIR"/* "$CONF_DIR"/.[!.]* "$CONF_DIR"/..?*; do
+      [[ -e "$path" || -L "$path" ]] || continue
+      ${SUDO} rm -rf -- "$path" || rc=1
+    done
+    ${SUDO} cp -a "$snapshot/conf/." "$CONF_DIR/" || rc=1
+    if (( state_existed )); then
+      ${SUDO} cp -a "$snapshot/state" "$DOMAIN_ONLY_STATE" || rc=1
+    else
+      ${SUDO} rm -f "$DOMAIN_ONLY_STATE" || rc=1
+    fi
+    if (( rc )); then
+      error "恢复文件失败；备份保留在 ${snapshot}，请立即检查。"
+      return 1
+    fi
+    ${SUDO} rm -rf "$snapshot"
+    if ! reload_nginx_safe; then
+      error "磁盘配置已恢复，但旧配置重载失败；请检查 Nginx 服务状态。"
+    fi
+  }
+  trap 'trap - HUP INT TERM; nx_transaction_restore; exit 1' HUP INT TERM
   if "$@" && nx_access_sync_files && reload_nginx_safe; then
+    trap - HUP INT TERM
     ${SUDO} rm -rf "$snapshot"
     return 0
   fi
-  error "配置应用失败，正在恢复本次操作前的配置与访问策略。"
-  # Only this configured directory is restored; never touch nginx system paths.
-  local path
-  for path in "$CONF_DIR"/* "$CONF_DIR"/.[!.]* "$CONF_DIR"/..?*; do
-    [[ -e "$path" || -L "$path" ]] || continue
-    ${SUDO} rm -rf -- "$path" || rc=1
-  done
-  ${SUDO} cp -a "$snapshot/conf/." "$CONF_DIR/" || rc=1
-  if (( state_existed )); then
-    ${SUDO} cp -a "$snapshot/state" "$DOMAIN_ONLY_STATE" || rc=1
-  else
-    ${SUDO} rm -f "$DOMAIN_ONLY_STATE" || rc=1
-  fi
-  if (( rc )); then
-    error "恢复文件失败；备份保留在 ${snapshot}，请立即检查。"
-    return 1
-  fi
-  ${SUDO} rm -rf "$snapshot"
-  if ! reload_nginx_safe; then
-    error "磁盘配置已恢复，但旧配置重载失败；请检查 Nginx 服务状态。"
-  fi
+  trap - HUP INT TERM
+  nx_transaction_restore
   return 1
-}
+)
 
 nx_write_conf() {
   local tmp="$1" target="$2" old="${3:-}"
-  if [[ -n "$old" && "$old" != "$target" && -e "$target" ]]; then
+  nx_conf_path_allowed "$target" || return 1
+  [[ -z "$old" ]] || nx_conf_path_allowed "$old" || return 1
+  if [[ -n "$old" && "$old" != "$target" && ( -e "$target" || -e "${target%.bak}.bak" && "${target%.bak}.bak" != "$old" || -e "${target%.bak}" && "${target%.bak}" != "$old" ) ]]; then
     error "目标配置已存在，拒绝覆盖：${target}"
     return 1
   fi
@@ -56,9 +71,19 @@ nx_write_conf() {
     sed '/^# access_policy=/d; /^# access_default=/d' "$tmp" > "$metadata" || { rm -f "$metadata"; return 1; }
     for key in access_policy access_default; do
       value="$(conf_meta_get "$old" "$key")"
+      if [[ "$key" == access_default && -n "$value" ]]; then
+        local before after
+        before="$(nx_access_parse "$old")" || { rm -f "$metadata"; return 1; }
+        after="$(nx_access_parse "$tmp")" || { rm -f "$metadata"; return 1; }
+        value="$(nx_conf_query defaults "$tmp" "$value" "$before" "$after")" || { rm -f "$metadata"; return 1; }
+      fi
       if [[ -n "$value" ]]; then printf '\n# %s=%s\n' "$key" "$value" >> "$metadata"; fi
     done
-    install_managed_file "$metadata" "$target" || { rm -f "$metadata"; return 1; }
+    if [[ "$target" == "$old" ]]; then
+      ${SUDO} tee "$target" < "$metadata" >/dev/null || { rm -f "$metadata"; return 1; }
+    else
+      if ! ${SUDO} cp -a "$old" "$target" || ! ${SUDO} tee "$target" < "$metadata" >/dev/null; then rm -f "$metadata"; return 1; fi
+    fi
     rm -f "$metadata"
   else
     install_managed_file "$tmp" "$target" || return 1
@@ -70,27 +95,13 @@ nx_write_conf() {
 }
 
 apply_conf_with_rollback() {
-  local target="$2" backup="" existed=0 rc=0
-  # Callers may edit an imported file outside CONF_DIR. Include that target too.
-  if [[ "$(dirname "$target")" != "$CONF_DIR" ]]; then
-    backup="$(mktemp /tmp/nginxx-target-XXXXXX)" || return 1
-    if [[ -e "$target" ]]; then
-      existed=1
-      ${SUDO} cp -a "$target" "$backup" || { rm -f "$backup"; return 1; }
-    fi
-  fi
-  nx_transaction nx_write_conf "$@" || rc=1
-  if [[ -n "$backup" ]]; then
-    if (( rc )); then
-      if (( existed )); then ${SUDO} cp -a "$backup" "$target"; else ${SUDO} rm -f "$target"; fi
-      reload_nginx_safe >/dev/null 2>&1 || true
-    fi
-    ${SUDO} rm -f "$backup"
-  fi
-  return "$rc"
+  nx_conf_path_allowed "$2" || return 1
+  [[ -z "${3:-}" ]] || nx_conf_path_allowed "$3" || return 1
+  nx_transaction nx_write_conf "$@"
 }
 
 nx_move_conf() {
+  nx_conf_path_allowed "$1" && nx_conf_path_allowed "$2" || return 1
   [[ -f "$1" && ! -e "$2" ]] || { error "源配置不存在或目标已存在。"; return 1; }
   ${SUDO} mv "$1" "$2"
 }
@@ -125,7 +136,7 @@ edit_conf_manual() {
     rm -f "$tmp"
     return 1
   fi
-  if ! mark_conf_manual_edited "$tmp" || ! apply_conf_with_rollback "$tmp" "$CONF_DIR/$file"; then
+  if ! mark_conf_manual_edited "$tmp" || ! apply_conf_with_rollback "$tmp" "$CONF_DIR/$file" "$CONF_DIR/$file"; then
     rm -f "$tmp"
     return 1
   fi
@@ -145,4 +156,53 @@ nx_site_https_toggle() {
   fi
 }
 
-nx_remove_conf() { ${SUDO} rm -f "$1"; }
+nx_remove_conf() { nx_conf_path_allowed "$1" && ${SUDO} rm -f "$1"; }
+
+# Every mutated site must be a regular immediate child of the snapshot directory.
+nx_conf_path_allowed() {
+  [[ -n "$1" && "$(dirname -- "$1")" == "$CONF_DIR" && ! -L "$1" && "$(basename -- "$1")" != .* ]] || {
+    error "拒绝事务目录外路径或符号链接：$1"; return 1;
+  }
+}
+nx_assert_new_target() {
+  local base="${1%.bak}"
+  [[ ! -e "$base" && ! -L "$base" && ! -e "$base.bak" && ! -L "$base.bak" ]] || {
+    error "站点配置已存在（包括停用配置），请使用修改菜单。"; return 1;
+  }
+}
+
+# Render TLS before publication. Never activate a temporary plain-text version.
+nx_preserve_modify_tls() {
+  local src="$1" candidate="$2" domain="$3" requested="$4" stage original old_domain
+  conf_https_enabled "$src" || return 0
+  old_domain="$(extract_domain_from_conf "$src")" || return 1
+  [[ "$domain" == "$old_domain" || -f "$SSL_DIR/$domain/fullchain.pem" && -f "$SSL_DIR/$domain/privkey.pem" ]] || {
+    error "HTTPS 修改需要目标域名的现有证书；原配置保持不变。"; return 1;
+  }
+  original="$(conf_meta_get "$src" https_original_listen_port)"
+  [[ -n "$original" ]] || original="$(conf_meta_get "$src" listen_port)"
+  [[ -n "$original" ]] || original=80
+  stage="$(mktemp)" || return 1
+  if ! nx_https_transform enable "$candidate" "$domain" "$SSL_DIR" "$requested" > "$stage"; then rm -f "$stage"; return 1; fi
+  nx_access_metadata "$stage" https_original_listen_port "$original" || { rm -f "$stage"; return 1; }
+  # Preserve custom certificate paths/options when the hostname is unchanged.
+  if [[ "$domain" == "$old_domain" ]]; then
+    python3 - "$src" "$stage" <<'PY'
+import re, sys
+old=open(sys.argv[1]).read(); new=open(sys.argv[2]).read()
+for key in ('ssl_certificate','ssl_certificate_key','ssl_protocols'):
+    pattern=r'(?m)^\s*'+key+r'\s+[^;]+;'
+    values=re.findall(pattern,old)
+    if len(values)==1: new=re.sub(pattern,lambda _:values[0],new)
+open(sys.argv[2],'w').write(new)
+PY
+  fi
+  cat "$stage" > "$candidate" || { rm -f "$stage"; return 1; }
+  rm -f "$stage"
+}
+
+# Recheck uniqueness while holding the transaction lock (menu preflight is only UX).
+nx_add_conf() {
+  nx_assert_new_target "$2" || return 1
+  nx_write_conf "$@"
+}

@@ -17,13 +17,35 @@ nx_access_parse() {
   local file="$1" mode="${2:-scan}" strict="${3:-0}" defaults="${4:-}"
   awk -v mode="$mode" -v strict="$strict" -v defaults="$defaults" '
   function fail(s) { print "access policy: " FILENAME ": " s > "/dev/stderr"; bad=1; exit 1 }
-  function socket(s, p,a,n,i) {
+  function ipv6(s, halves,l,r,nl,nr,i,out,a,b,parts,best,start,len,bestlen) {
+    n=split(s,halves,"::"); if(n>2) fail("invalid IPv6")
+    nl=split(halves[1],a,":"); if(halves[1]=="") nl=0
+    nr=0; if(n==2 && halves[2]!="") nr=split(halves[2],b,":")
+    if((n==1 && nl!=8) || (n==2 && nl+nr>=8)) fail("invalid IPv6")
+    out=""; for(i=1;i<=8;i++) {
+      if(i<=nl) l=a[i]; else if(i>8-nr) l=b[i-(8-nr)]; else l="0"
+      if(length(l)>4 || l !~ /^[0-9a-fA-F]+$/) fail("invalid IPv6")
+      l=tolower(l); sub(/^0+/,"",l); if(l=="") l="0"
+      out=out (i==1?"":":") l
+    }
+    split(out,parts,":"); best=0; bestlen=0; start=0; len=0
+    for(i=1;i<=9;i++) {
+      if(i<=8 && parts[i]=="0") {if(!len) start=i; len++}
+      else {if(len>bestlen) {best=start; bestlen=len}; len=0}
+    }
+    if(bestlen<2) return out
+    out=""; for(i=1;i<best;i++) out=out (i==1?"":":") parts[i]
+    out=out "::"; for(i=best+bestlen;i<=8;i++) out=out (i==best+bestlen?"":":") parts[i]
+    return out
+  }
+  function socket(s, p,a,n,i,host) {
     if(s ~ /^[0-9]+$/) s="0.0.0.0:" s
     sub(/^\*:/,"0.0.0.0:",s)
     if(s !~ /^([0-9]+\.)+[0-9]+:[0-9]+$/ && s !~ /^\[[0-9a-fA-F:]+\]:[0-9]+$/) fail("unsupported listen address " s)
     p=s; sub(/^.*:/,"",p); if(p+0<1 || p+0>65535) fail("invalid listen port")
     if(s !~ /^\[/) { a=s; sub(/:[0-9]+$/,"",a); n=split(a,t,"."); if(n!=4) fail("invalid IPv4 address"); for(i=1;i<=4;i++) if(t[i]+0>255) fail("invalid IPv4 address") }
-    return tolower(s)
+    if(s ~ /^\[/) {host=s; sub(/^\[/,"",host); sub(/\]:[0-9]+$/,"",host); return "[" ipv6(host) "]:" (p+0)}
+    return substr(s,1,length(s)-length(p)) (p+0)
   }
   function directive(end,    x,n,a,i,s,ssl,def,k) {
     x=token; gsub(/^[ \t\r\n]+|[ \t\r\n]+$/,"",x); token=""
@@ -35,7 +57,7 @@ nx_access_parse() {
     if(end=="}") { if(active && depth==1) {finish[active]=pos; active=0}; depth--; if(depth<0) fail("unbalanced braces"); return }
     if(!active || depth!=1) { if(mode=="transform" && depth==0 && x!="") fail("top-level directive cannot be safely inspected"); return }
     n=split(x,a,/[ \t\r\n]+/)
-    if(a[1]=="include") fail("server-level include cannot be safely inspected")
+    if(a[1]=="include" && mode!="relaxed") fail("server-level include cannot be safely inspected")
     if(a[1]=="listen") {
       if(n<2) fail("empty listen")
       s=socket(a[2]); ssl=0; def=0
@@ -58,6 +80,7 @@ nx_access_parse() {
   {if(skip) next; line=$0; sub(/ default_server # nx-access-default$/, "",line); text=text line "\n"}
   END {
     if(bad) exit 1; if(skip) fail("unterminated policy marker")
+    canonical_defaults=""; nd=split(defaults,dparts,","); for(di=1;di<=nd;di++) if(dparts[di]!="") canonical_defaults=canonical_defaults (canonical_defaults==""?"":",") socket(dparts[di]); defaults=canonical_defaults
     depth=0; quote=""; comment=0; escape=0; token=""
     for(pos=1;pos<=length(text);pos++) {
       c=substr(text,pos,1)
@@ -80,7 +103,7 @@ nx_access_parse() {
       if(strict && names[i]=="") fail("strict policy requires server_name")
     }
     n=split(defaults,ds,","); for(i=1;i<=n;i++) if(ds[i]!="" && selected[ds[i]]!=1) fail("default socket must identify exactly one server: " ds[i])
-    if(mode=="scan") {for(i=1;i<=listeners;i++) print owner[i] "|" sock[i] "|" tls[i] "|" existing[i] "|" names[owner[i]]; exit}
+    if(mode=="scan" || mode=="relaxed") {for(i=1;i<=listeners;i++) print owner[i] "|" sock[i] "|" tls[i] "|" existing[i] "|" names[owner[i]]; exit}
     if(strict) for(i=1;i<=srv;i++) {
       n=split(names[i],ns," "); pattern=""; for(j=1;j<=n;j++) {sub(/\.$/,"",ns[j]); gsub(/\./,"\\.",ns[j]); pattern=pattern (j==1?"":"|") ns[j]}
       # $http_host proves Host was actually supplied; $host alone falls back to server_name.
@@ -122,11 +145,13 @@ nx_access_metadata() {
 
 nx_access_set_policy_files() {
   case "$2" in inherit|strict|open) ;; *) return 1;; esac
+  nx_conf_path_allowed "$1" || return 1
   nx_access_metadata "$1" access_policy "$2"
 }
 nx_access_set_policy() { nx_transaction nx_access_set_policy_files "$@"; }
 nx_access_set_default_files() {
   [[ "$2" != *$'\n'* && "$2" != *$'\r'* ]] || return 1
+  nx_conf_path_allowed "$1" || return 1
   nx_access_metadata "$1" access_default "$2"
 }
 nx_access_set_default() { nx_transaction nx_access_set_default_files "$@"; }
@@ -163,6 +188,9 @@ nx_access_sync_files() {
     [[ -f "$file" && "$file" != "$(domain_only_conf_path)" && -z "${managed[$file]:-}" ]] || continue
     # Non-server helper files (maps etc.) have no listen directives.
     if ! grep -qE '(^|[;{}[:space:]])listen[[:space:]]' "$file"; then continue; fi
+    # With no strict sockets or explicit defaults, unrelated includes cannot
+    # affect this operation. Otherwise inspect conservatively and fail closed.
+    if ((${#required[@]} == 0 && ${#occupied[@]} == 0)); then continue; fi
     rows="$(nx_access_parse "$file")" || { rm -rf "$stage"; return 1; }
     while IFS='|' read -r _server socket ssl def _names; do
       [[ -n "$socket" ]] || continue
