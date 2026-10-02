@@ -72,7 +72,11 @@ cmp "$root/raw-before" "$root/bin/raw-nx"
 echo 'ok: old updater exec migration and bootstrap privilege-boundary paths'
 # The 39007be bundled updater invokes install.sh rather than copying the loader.
 # Freeze its implementation so current identity checks cannot hide regressions.
+# A preceding installer may publish a root-owned executable through sudo.
+# Recreate this test fixture via its caller-owned directory, not an in-place write.
+rm -f "$root/bin/nx"
 printf '#!/bin/sh\nexit 0\n' > "$root/bin/nx"
+chmod +x "$root/bin/nx"
 PATH="$root/bin:$PATH" REPO_INSTALL_DIR="$root/source" bash -s -- "$repo" "$root" <<'RUN'
 source "$1/nx.sh"
 source "$1/tests/fixtures/legacy-bundle-update.sh"
