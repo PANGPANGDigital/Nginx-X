@@ -150,9 +150,9 @@ bash install.sh
 
 ## 系统兼容性
 
-- 原生支持：Ubuntu / Debian / CentOS / Alpine / OpenWrt
+- 提供 Ubuntu / Debian / CentOS / Alpine / OpenWrt 的包管理器适配；各发行版版本、服务管理器和预装组件可能不同
 - 包管理器自动检测（apt / yum / dnf / apk / opkg）
-- BusyBox 兼容（`grep`/`sed`/`awk` 替代 GNU 版本差异）
+- 脚本需要 Bash；部分操作另需 Python 3、OpenSSL 及标准文件工具。Alpine CI 安装这些运行依赖，不能据此推断所有精简 BusyBox 镜像都具备相同环境。
 - Nginx 安装后自动适配配置目录：Alpine 使用 `http.d`，其他系统使用 `conf.d`
 
 ## 已知限制
@@ -178,25 +178,6 @@ access_log /var/log/nginx/access.host.log nginxx_host;
 
 这样脚本会优先读取 `access.host.log`，按域名做更准确的请求数和下行统计。
 
-## 开发校验
-
-本仓库已包含 GitHub Actions 基础 CI：
-
-- `bash -n nx.sh`
-- `bash -n install.sh`
-- `shellcheck -x nx.sh install.sh`
-- `bash tests/https_config_regression.sh`
-- 真实 `nginx -t` 校验生成的内部与外部 HTTPS 配置
-
-本地也可以直接运行：
-
-```bash
-bash -n nx.sh
-bash -n install.sh
-shellcheck -x nx.sh install.sh tests/https_config_regression.sh
-for test_file in tests/*.sh; do bash "$test_file"; done
-```
-
 ## 交互规范
 
 - 主菜单使用数字编号
@@ -215,4 +196,4 @@ for f in tests/*.sh; do bash "$f"; done
 bash tools/build-bundle.sh /tmp/nx-bundle
 ```
 
-真实请求测试需要 `nginx`、Python 3、OpenSSL 和 curl；可通过 `NGINX_BIN` 指定隔离二进制。测试使用临时配置、证书、PID、日志和高位端口，不操作系统 Nginx 服务。CI 安装依赖并运行 mock 回滚、真实 HTTP/TLS 请求、IPv6、ACME、默认站点和 HTTPS 保留测试。
+真实请求测试需要 `nginx`、Python 3、OpenSSL 和 curl；可通过 `NGINX_BIN` 指定隔离二进制。测试使用临时配置、证书、PID、日志和高位端口，不操作系统 Nginx 服务。CI 在 Ubuntu 22.04、Ubuntu 24.04 和 Alpine 3.22 中安装依赖并运行回归，覆盖 mock 回滚、真实 HTTP/TLS 请求、IPv6、ACME、默认站点和 HTTPS 保留。Ubuntu 任务还检查全部源码及生成 bundle 的 ShellCheck。OpenWrt/CentOS 的完整实机生命周期不在当前 CI 覆盖范围内。
