@@ -28,6 +28,8 @@ try:
     text = re.sub(r" default_server # nx-access-default\n", "", text)
     # Quotes, comments, escaped characters, and ${variables} cannot alter nesting.
     tokens = []
+    metadata = {}
+    depth = 0
     i = 0
     while i < len(text):
         if text[i].isspace():
@@ -35,10 +37,22 @@ try:
             continue
         if text[i] == '#':
             end = text.find('\n', i)
-            i = len(text) if end < 0 else end + 1
+            end = len(text) if end < 0 else end + 1
+            line_start = text.rfind('\n', 0, i) + 1
+            # Setters append metadata after server blocks. Only standalone
+            # top-level comments count, never strings or comments in a block.
+            if depth == 0 and not text[line_start:i].strip():
+                match = re.fullmatch(r'# ([A-Za-z_][A-Za-z_0-9]*)=([^\r\n]*)(?:\r?\n)?', text[i:end])
+                if match:
+                    metadata.setdefault(match[1], []).append((line_start, end, match[2]))
+            i = end
             continue
         start = i
         if text[i] in '{};':
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
             i += 1
         else:
             quote = None
@@ -168,35 +182,41 @@ try:
     tls = 'ssl' in parsed[0][2]
     if any(n['args'][0].startswith('ssl_') and n not in app['children'] for n in walk(app)):
         fail('nested TLS directives are unsupported')
-    # Metadata belongs only in the header, never in a quoted directive or body comment.
-    header = text[:nodes[0]['start']]
     def meta(key):
-        values = re.findall(r'^# ' + re.escape(key) + r'=([^\r\n]*)$', header, re.M)
+        values = metadata.get(key, [])
         if len(values) > 1:
             fail('duplicate metadata: ' + key)
-        return values[0] if values else ''
+        return values[0][2] if values else ''
     edits = []
     # Move explicit managed default selections together with application sockets.
-    # Selections on unchanged port 80 remain attached to the renewal redirect.
     default_sockets = meta('access_default')
-    def remap_defaults(old_port, new_port):
+    def socket(address, number):
+        return (address.lower() if address and address != '*:' else '0.0.0.0:') + number
+    def remap_defaults(old_port, new_port, removing_redirect=False):
         if not default_sockets:
             return
         updated = []
+        application_sockets = {socket(address, old_port): socket(address, new_port) for address, _, _ in parsed}
+        remaining_sockets = set(application_sockets.values())
+        removed_sockets = {socket(address, number) for node in redirects for address, number, _ in map(listener, directives(node, 'listen'))}
+        # A removed redirect loses its selection unless the application returns
+        # to that same socket; the latter can merge two selected defaults.
         for entry in default_sockets.split(','):
-            prefix, separator, entry_port = entry.rpartition(':')
-            updated.append(prefix + separator + (new_port if entry_port == old_port else entry_port))
+            entry = application_sockets.get(entry, entry)
+            if removing_redirect and entry in removed_sockets and entry not in remaining_sockets:
+                continue
+            if entry not in updated:
+                updated.append(entry)
         setmeta('access_default', ','.join(updated))
     def replace(node, value):
         edits.append((node['start'], node['end'], value))
     def setmeta(key, value):
-        pattern = r'^# ' + re.escape(key) + r'=[^\r\n]*(?:\r?\n|$)'
-        matches = list(re.finditer(pattern, header, re.M))
+        matches = metadata.get(key, [])
         if len(matches) > 1:
             fail('duplicate metadata: ' + key)
         replacement = '# ' + key + '=' + value + '\n' if value is not None else ''
         if matches:
-            edits.append((matches[0].start(), matches[0].end(), replacement))
+            edits.append((matches[0][0], matches[0][1], replacement))
         elif replacement:
             edits.append((0, 0, replacement))
     if operation == 'enable':
@@ -245,7 +265,7 @@ try:
                 replace(node, '')
         for node in redirects:
             replace(node, '')
-        remap_defaults(parsed[0][1], target)
+        remap_defaults(parsed[0][1], target, removing_redirect=True)
         setmeta('https_enabled', 'false')
         setmeta('listen_port', target)
         setmeta('https_original_listen_port', None)
