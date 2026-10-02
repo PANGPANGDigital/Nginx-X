@@ -233,8 +233,9 @@ enable_https_for_conf_file "example.com" "$http_conf"
 grep -q '^# listen_port=443$' "$http_conf"
 grep -q 'listen 443 ssl' "$http_conf"
 grep -q 'listen 443 ssl http2;' "$http_conf"
-grep -q 'listen \[::\]:443 ssl http2;' "$http_conf"
-grep -q 'listen \[::\]:80;' "$http_conf"
+if grep -q 'listen \[::\]' "$http_conf"; then
+  echo 'HTTPS conversion must not add a new address family' >&2; exit 1
+fi
 if grep -q 'http2 on;' "$http_conf"; then
   echo "unexpected directive: http2 on;" >&2
   exit 1

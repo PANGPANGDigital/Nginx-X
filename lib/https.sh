@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# Config-preserving HTTPS transitions. Sourced after nx.sh's legacy functions.
+# Python's tokenizer tracks source offsets so untouched directives remain byte-for-byte.
+# Unsupported/ambiguous configurations fail before the transactional apply helper runs.
+
+nx_https_transform() {
+  command -v python3 >/dev/null 2>&1 || { error "保留配置的 HTTPS 操作需要 python3。" >&2; return 1; }
+  python3 - "$@" <<'PY'
+import re
+import sys
+
+operation, filename, domain, ssl_dir, requested = sys.argv[1:]
+
+def fail(message):
+    raise ValueError(message)
+
+def port(value):
+    if not re.fullmatch(r'[0-9]+', value) or not 1 <= int(value) <= 65535:
+        fail('invalid port: ' + value)
+    return str(int(value))
+
+try:
+    with open(filename, encoding='utf-8', newline='') as source:
+        text = source.read()
+    original_text = text
+    # Access guards are derived from metadata and regenerated in the transaction.
+    text = re.sub(r"(?m)^\s*# nx-access-begin\n.*?^\s*# nx-access-end\n", "\n", text, flags=re.S | re.M)
+    text = re.sub(r" default_server # nx-access-default\n", "", text)
+    # Quotes, comments, escaped characters, and ${variables} cannot alter nesting.
+    tokens = []
+    i = 0
+    while i < len(text):
+        if text[i].isspace():
+            i += 1
+            continue
+        if text[i] == '#':
+            end = text.find('\n', i)
+            i = len(text) if end < 0 else end + 1
+            continue
+        start = i
+        if text[i] in '{};':
+            i += 1
+        else:
+            quote = None
+            while i < len(text):
+                c = text[i]
+                if c == '\\':
+                    i += 2
+                    continue
+                if quote:
+                    if c == quote:
+                        quote = None
+                    i += 1
+                    continue
+                if c in '\"\'':
+                    quote = c
+                    i += 1
+                    continue
+                if text.startswith('${', i):
+                    end = text.find('}', i + 2)
+                    if end < 0:
+                        fail('unterminated variable')
+                    i = end + 1
+                    continue
+                if c.isspace() or c in '{};#':
+                    break
+                i += 1
+            if quote or i > len(text):
+                fail('unterminated quote/escape')
+        tokens.append((text[start:i], start, i))
+
+    cursor = 0
+    def parse(nested=False):
+        global cursor
+        nodes = []
+        while cursor < len(tokens):
+            if tokens[cursor][0] == '}':
+                if not nested:
+                    fail('unexpected closing brace')
+                closing = tokens[cursor][2]
+                cursor += 1
+                return nodes, closing
+            args = []
+            start = tokens[cursor][1]
+            while cursor < len(tokens) and tokens[cursor][0] not in '{};':
+                args.append(tokens[cursor][0])
+                cursor += 1
+            if not args or cursor >= len(tokens):
+                fail('incomplete directive')
+            delimiter, opening, end = tokens[cursor]
+            cursor += 1
+            children = None
+            if delimiter == '{':
+                children, end = parse(True)
+            elif delimiter != ';':
+                fail('missing semicolon')
+            nodes.append(dict(args=args, start=start, end=end, opening=opening, children=children))
+        if nested:
+            fail('unclosed block')
+        return nodes, len(text)
+
+    nodes, _ = parse()
+    servers = [n for n in nodes if n['args'] == ['server'] and n['children'] is not None]
+    if not servers or any(n['args'][0] == 'include' for n in nodes):
+        fail('expected explicit server blocks without top-level includes')
+    def directives(node, name):
+        return [n for n in node['children'] if n['args'][0] == name]
+    def walk(node):
+        for child in node['children'] or []:
+            yield child
+            yield from walk(child)
+    def names(node):
+        found = directives(node, 'server_name')
+        if len(found) != 1:
+            fail('expected one explicit server_name directive')
+        return found[0]['args'][1:]
+    def listener(node):
+        args = node['args'][1:]
+        if not args or node['children'] is not None:
+            fail('invalid listen directive')
+        address = args[0]
+        match = re.fullmatch(r'(\[[0-9a-fA-F:.]+\]:|(?:[0-9.]+|\*):)?([0-9]+)', address)
+        if not match:
+            fail('unsupported listen address: ' + address)
+        if any(a in ('quic', 'udp') or '$' in a for a in args):
+            fail('unsupported listen option')
+        return match[1] or '', port(match[2]), args[1:]
+    def redirect(node):
+        returns = directives(node, 'return')
+        redirect_locations = [n for n in node['children'] if n['args'] == ['location', '/'] and n['children'] is not None]
+        if not returns and len(redirect_locations) == 1:
+            returns = directives(redirect_locations[0], 'return')
+        if len(returns) != 1 or not re.fullmatch(r'https://\$host(?::[0-9]+)?\$request_uri', returns[0]['args'][-1]):
+            return False
+        if returns[0]['args'][1] not in ('301', '308'):
+            return False
+        for child in node['children']:
+            if child in redirect_locations and child['children'] == returns:
+                continue
+            if child['args'][0] in ('listen', 'server_name', 'return') and child['children'] is None:
+                continue
+            if child['args'] != ['location', '^~', '/.well-known/acme-challenge/']:
+                return False
+            # Only the known generated ACME block can be removed with a redirect.
+            if child['children'] is None or [n['args'] for n in child['children']] != [
+                ['root', '/usr/share/nginx/html'], ['default_type', '"text/plain"'], ['try_files', '$uri', '=404']]:
+                return False
+        return all(listener(n)[1] == '80' and 'ssl' not in listener(n)[2] for n in directives(node, 'listen'))
+
+    redirects = [s for s in servers if redirect(s)]
+    apps = [s for s in servers if s not in redirects]
+    if len(apps) != 1 or len(redirects) > 1:
+        fail('expected one application server and at most one plain generated redirect')
+    app = apps[0]
+    aliases = names(app)
+    if domain not in aliases:
+        fail('requested domain is not an explicit server_name')
+    if redirects and names(redirects[0]) != aliases:
+        fail('redirect aliases differ from application server')
+    if any(n['args'][0] == 'include' for n in walk(app)):
+        fail('server includes may hide TLS/listen directives; inline them before changing HTTPS')
+    listens = directives(app, 'listen')
+    if not listens:
+        fail('implicit listen is unsupported')
+    parsed = [listener(n) for n in listens]
+    if len({p[1] for p in parsed}) != 1 or len({'ssl' in p[2] for p in parsed}) != 1:
+        fail('mixed listener ports or protocols are unsupported')
+    tls = 'ssl' in parsed[0][2]
+    if any(n['args'][0].startswith('ssl_') and n not in app['children'] for n in walk(app)):
+        fail('nested TLS directives are unsupported')
+    # Metadata belongs only in the header, never in a quoted directive or body comment.
+    header = text[:nodes[0]['start']]
+    def meta(key):
+        values = re.findall(r'^# ' + re.escape(key) + r'=([^\r\n]*)$', header, re.M)
+        if len(values) > 1:
+            fail('duplicate metadata: ' + key)
+        return values[0] if values else ''
+    edits = []
+    # Move explicit managed default selections together with application sockets.
+    # Selections on unchanged port 80 remain attached to the renewal redirect.
+    default_sockets = meta('access_default')
+    def remap_defaults(old_port, new_port):
+        if not default_sockets:
+            return
+        updated = []
+        for entry in default_sockets.split(','):
+            prefix, separator, entry_port = entry.rpartition(':')
+            updated.append(prefix + separator + (new_port if entry_port == old_port else entry_port))
+        setmeta('access_default', ','.join(updated))
+    def replace(node, value):
+        edits.append((node['start'], node['end'], value))
+    def setmeta(key, value):
+        pattern = r'^# ' + re.escape(key) + r'=[^\r\n]*(?:\r?\n|$)'
+        matches = list(re.finditer(pattern, header, re.M))
+        if len(matches) > 1:
+            fail('duplicate metadata: ' + key)
+        replacement = '# ' + key + '=' + value + '\n' if value is not None else ''
+        if matches:
+            edits.append((matches[0].start(), matches[0].end(), replacement))
+        elif replacement:
+            edits.append((0, 0, replacement))
+    if operation == 'enable':
+        if tls:
+            if requested and port(requested) not in (parsed[0][1], '80' if parsed[0][1] == '443' else parsed[0][1]):
+                fail('already enabled; disable HTTPS before changing its port')
+            sys.stdout.write(original_text)
+            sys.exit(0)
+        if redirects or any(n['args'][0].startswith('ssl_') or n['args'][0] in ('ssl', 'http2') for n in walk(app)):
+            fail('existing TLS directives on a plain server are ambiguous')
+        original = parsed[0][1]
+        target = port(requested or meta('listen_port') or original)
+        if target == '80':
+            target = '443'
+        for node, (address, _, options) in zip(listens, parsed):
+            replace(node, 'listen ' + ' '.join([address + target] + options + ['ssl', 'http2']) + ';')
+        certpath = ssl_dir.rstrip('/') + '/' + domain
+        if re.search(r'[\s;{}\"\'\\$#]', certpath):
+            fail('unsupported characters in certificate path')
+        certs = '\n    ssl_certificate     ' + certpath + '/fullchain.pem;\n    ssl_certificate_key ' + certpath + '/privkey.pem;\n    ssl_protocols TLSv1.2 TLSv1.3;\n'
+        edits.append((app['opening'] + 1, app['opening'] + 1, certs))
+        # Retain exactly the existing listener families and bindings on redirect port 80.
+        redirect_listens = []
+        for address, _, options in parsed:
+            redirect_listens.append('    listen ' + ' '.join([address + '80'] + options) + ';')
+        suffix = '' if target == '443' else ':' + target
+        block = 'server {\n' + '\n'.join(redirect_listens) + '\n    server_name ' + ' '.join(aliases) + ';\n'
+        block += '    location ^~ /.well-known/acme-challenge/ {\n        root /usr/share/nginx/html;\n        default_type "text/plain";\n        try_files $uri =404;\n    }\n'
+        block += '    location / { return 301 https://$host' + suffix + '$request_uri; }\n}\n\n'
+        edits.append((app['start'], app['start'], block))
+        remap_defaults(original, target)
+        setmeta('https_original_listen_port', original)
+        setmeta('https_enabled', 'true')
+        setmeta('listen_port', target)
+    elif operation == 'disable':
+        if not tls:
+            if redirects:
+                fail('redirect beside a plain application server is ambiguous')
+            sys.stdout.write(original_text)
+            sys.exit(0)
+        target = port(meta('https_original_listen_port') or meta('listen_port') or '80')
+        for node, (address, _, options) in zip(listens, parsed):
+            replace(node, 'listen ' + ' '.join([address + target] + [o for o in options if o not in ('ssl', 'http2')]) + ';')
+        for node in app['children']:
+            if node['args'][0].startswith('ssl_') or node['args'][0] in ('ssl', 'http2'):
+                replace(node, '')
+        for node in redirects:
+            replace(node, '')
+        remap_defaults(parsed[0][1], target)
+        setmeta('https_enabled', 'false')
+        setmeta('listen_port', target)
+        setmeta('https_original_listen_port', None)
+    else:
+        fail('unknown operation')
+    for start, end, replacement in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
+        text = text[:start] + replacement + text[end:]
+    sys.stdout.write(text)
+except (ValueError, OSError, UnicodeError) as exc:
+    print('HTTPS transformation refused: ' + str(exc), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+nx_https_apply() {
+  local operation="$1" domain="$2" conf_file="$3" requested="${4:-}" tmp rc=0
+  [[ -f "$conf_file" ]] || { error "配置文件不存在：${conf_file}"; return 1; }
+  if [[ "$operation" == enable ]] && [[ ! -f "${SSL_DIR}/${domain}/fullchain.pem" || ! -f "${SSL_DIR}/${domain}/privkey.pem" ]]; then
+    error "未找到证书文件：${SSL_DIR}/${domain}/"
+    return 1
+  fi
+  tmp="$(mktemp /tmp/nginxx-https-preserve-XXXXXX)" || return 1
+  if nx_https_transform "$operation" "$conf_file" "$domain" "$SSL_DIR" "$requested" > "$tmp"; then
+    if ! cmp -s "$tmp" "$conf_file"; then
+      apply_conf_with_rollback "$tmp" "$conf_file" || rc=$?
+    fi
+  else
+    rc=$?
+  fi
+  rm -f "$tmp"
+  if (( rc == 0 )); then
+    info "HTTPS ${operation}：$(basename "$conf_file")（保留站点配置）"
+  fi
+  return "$rc"
+}
+
+enable_https_for_conf_file() {
+  nx_https_apply enable "$1" "$2" "${3:-}"
+}
+
+disable_https_for_conf_file() {
+  nx_https_apply disable "$1" "$2"
+}

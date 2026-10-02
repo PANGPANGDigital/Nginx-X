@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT/nx.sh"
+T="$(mktemp -d)"
+trap 'rm -rf "$T"' EXIT
+CONF_DIR="$T/conf"
+STATE_DIR="$T/state"
+DOMAIN_ONLY_STATE="$STATE_DIR/domain-only.conf"
+SSL_DIR="$T/ssl"
+# shellcheck disable=SC2034
+SUDO=""
+mkdir -p "$CONF_DIR" "$STATE_DIR" "$SSL_DIR"
+reloads=0
+fail_reload=0
+fail_sync=0
+reload_nginx_safe() { reloads=$((reloads+1)); (( fail_reload == 0 )); }
+nx_access_sync_files() {
+  printf 'derived\n' > "$CONF_DIR/00-nx-domain-only.conf"
+  (( fail_sync == 0 ))
+}
+confirm() { return 0; }
+cat > "$CONF_DIR/site.conf" <<'EOF'
+# managed_by=Nginx-X
+# domain=site.example
+server {
+ listen 18080;
+ server_name site.example;
+ location / { return 200 'unchanged'; }
+}
+EOF
+cp "$CONF_DIR/site.conf" "$T/original"
+printf 'DOMAIN_ONLY=1\n' > "$DOMAIN_ONLY_STATE"
+printf 'original derived\n' > "$CONF_DIR/00-nx-domain-only.conf"
+assert_restored() {
+  cmp "$T/original" "$CONF_DIR/site.conf"
+  [[ ! -e "$CONF_DIR/site.conf.bak" ]]
+  [[ "$(cat "$CONF_DIR/00-nx-domain-only.conf")" == 'original derived' ]]
+  [[ "$(cat "$DOMAIN_ONLY_STATE")" == 'DOMAIN_ONLY=1' ]]
+}
+fail_reload=1
+for action in disable_conf delete_conf; do
+  if "$action" site.conf >/dev/null 2>&1; then echo "$action hid reload failure" >&2; exit 1; fi
+  assert_restored
+done
+run_editor() { printf '\n# edited\n' >> "$1"; }
+if edit_conf_manual site.conf >/dev/null 2>&1; then exit 1; fi
+assert_restored
+cp "$T/original" "$T/new"
+printf '\n# replacement\n' >> "$T/new"
+if apply_conf_with_rollback "$T/new" "$CONF_DIR/new.conf" "$CONF_DIR/site.conf" >/dev/null 2>&1; then exit 1; fi
+assert_restored
+[[ ! -e "$CONF_DIR/new.conf" ]]
+fail_reload=0
+fail_sync=1
+before="$reloads"
+if disable_conf site.conf >/dev/null 2>&1; then echo 'sync error hidden' >&2; exit 1; fi
+assert_restored
+# Only rollback reload occurs; no new configuration is activated before sync.
+[[ "$reloads" == "$((before+1))" ]]
+fail_sync=0
+disable_conf site.conf >/dev/null
+fail_reload=1
+if enable_conf site.conf.bak >/dev/null 2>&1; then exit 1; fi
+[[ -f "$CONF_DIR/site.conf.bak" && ! -e "$CONF_DIR/site.conf" ]]
+fail_reload=0
+enable_conf site.conf.bak >/dev/null
+apply_conf_with_rollback "$T/new" "$CONF_DIR/new.conf" "$CONF_DIR/site.conf" >/dev/null
+[[ ! -e "$CONF_DIR/site.conf" && -f "$CONF_DIR/new.conf" ]]
+[[ "$(stat -c '%a' "$CONF_DIR/new.conf")" == 644 ]]
+# Existing destination must never be overwritten by a rename.
+cp "$T/original" "$CONF_DIR/site.conf"
+if apply_conf_with_rollback "$T/new" "$CONF_DIR/new.conf" "$CONF_DIR/site.conf" >/dev/null 2>&1; then exit 1; fi
+cmp "$T/original" "$CONF_DIR/site.conf"
+echo 'ok: transaction failures and rename rollback'
+# A template modification must retain an explicit access policy.
+printf '\n# access_policy=strict\n' >> "$CONF_DIR/site.conf"
+apply_conf_with_rollback "$T/new" "$CONF_DIR/replaced.conf" "$CONF_DIR/site.conf" >/dev/null
+grep -q '^# access_policy=strict$' "$CONF_DIR/replaced.conf"
+# The interactive template editor must propagate failed apply and preserve a
+# disabled source without briefly activating it during a successful edit.
+cat > "$CONF_DIR/modify.example-18080.conf.bak" <<'SITE'
+# managed_by=Nginx-X
+# domain=modify.example
+# listen_port=18080
+# backend_port=3000
+server {
+ listen 18080;
+ server_name modify.example;
+ location / { proxy_pass http://127.0.0.1:3000; }
+}
+SITE
+is_port_used_os() { return 1; }
+ipv6_available() { return 1; }
+cp "$CONF_DIR/modify.example-18080.conf.bak" "$T/modify-before"
+fail_reload=1
+if modify_conf modify.example-18080.conf.bak <<< $'\n\n\n' >/dev/null 2>&1; then echo 'modify hid reload failure' >&2; exit 1; fi
+cmp "$T/modify-before" "$CONF_DIR/modify.example-18080.conf.bak"
+fail_reload=0
+modify_conf modify.example-18080.conf.bak <<< $'\n\n\n' >/dev/null
+[[ -f "$CONF_DIR/modify.example-18080.conf.bak" && ! -e "$CONF_DIR/modify.example-18080.conf" ]]
+echo 'ok: interactive modify failure propagation and disabled status'

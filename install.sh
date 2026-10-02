@@ -3,8 +3,8 @@ set -euo pipefail
 
 REPO_URL="https://github.com/Xiuyixx/Nginx-X.git"
 REPO_BRANCH="main"
-INSTALL_DIR="/opt/Nginx-X"
-TARGET_BIN="/usr/local/bin/nx"
+INSTALL_DIR="${INSTALL_DIR:-/opt/Nginx-X}"
+TARGET_BIN="${TARGET_BIN:-/usr/local/bin/nx}"
 NO_RUN="0"
 
 SUDO=""
@@ -74,7 +74,16 @@ install_local() {
   fi
 
   ${SUDO} mkdir -p "$(dirname "$TARGET_BIN")"
-  ${SUDO} install -m 0755 "$source_script" "$TARGET_BIN"
+  local bundle
+  bundle="$(mktemp /tmp/nginxx-bundle-XXXXXX)"
+  if ! bash "${script_dir}/tools/build-bundle.sh" "$bundle"; then
+    rm -f "$bundle"
+    exit 1
+  fi
+  # A single executable contains one coherent revision of every module.
+  ${SUDO} install -m 0755 "$bundle" "${TARGET_BIN}.new"
+  ${SUDO} mv -f "${TARGET_BIN}.new" "$TARGET_BIN"
+  rm -f "$bundle"
 
   echo "[OK] Installed. You can now run: nx"
 

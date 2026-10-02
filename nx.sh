@@ -15,17 +15,18 @@ NC='\033[0m'
 
 # ---------- 全局变量 ----------
 APP_NAME="Nginx-X"
-APP_VERSION="2.1.0 (2026-09-27)"
+APP_VERSION="3.0.0 (2026-10-02)"
 # Alpine 的 nginx 把 server 配置放在 http.d，其他系统用 conf.d
 if [[ -f /etc/nginx/http.d ]] || [[ -d /etc/nginx/http.d ]]; then
   CONF_DIR="/etc/nginx/http.d"
 else
   CONF_DIR="/etc/nginx/conf.d"
 fi
-SSL_DIR="/etc/nginx/ssl"
+CONF_DIR="${NX_CONF_DIR:-$CONF_DIR}"
+SSL_DIR="${SSL_DIR:-/etc/nginx/ssl}"
 NGINX_MAIN_CONF="${NGINX_MAIN_CONF:-/etc/nginx/nginx.conf}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nginxx"
+STATE_DIR="${STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/nginxx}"
 EMAIL_CONF="${STATE_DIR}/email.conf"
 DNS_CONF="${STATE_DIR}/dns.conf"
 DOMAIN_ONLY_STATE="${STATE_DIR}/domain-only.conf"
@@ -514,7 +515,7 @@ install_nginx_official() {
         error "依赖索引刷新失败。请检查网络连接、APT 源状态或稍后重试。"
         return 1
       fi
-      if ! ${SUDO} apt-get install -y curl wget socat cron gpg lsb-release ca-certificates; then
+      if ! ${SUDO} apt-get install -y python3 curl wget socat cron gpg lsb-release ca-certificates; then
         error "依赖安装失败。请检查网络连接、APT 源状态或稍后重试。"
         return 1
       fi
@@ -540,7 +541,7 @@ install_nginx_official() {
         warn "当前系统 ID=$os_id，仍尝试按 RHEL 系列方式安装。"
       fi
       ${SUDO} "$pkg" install -y epel-release || true
-      if ! ${SUDO} "$pkg" install -y curl wget socat cronie; then
+      if ! ${SUDO} "$pkg" install -y python3 curl wget socat cronie; then
         error "依赖安装失败。请检查网络连接、YUM/DNF 源状态或稍后重试。"
         return 1
       fi
@@ -562,7 +563,7 @@ REPO
       fi
       ;;
     apk)
-      if ! ${SUDO} apk add curl wget socat dcron openssl; then
+      if ! ${SUDO} apk add python3 curl wget socat dcron openssl; then
         error "依赖安装失败。请检查网络连接、APK 源状态或稍后重试。"
         return 1
       fi
@@ -578,7 +579,7 @@ REPO
         error "OPKG 索引刷新失败。请检查网络连接、软件源状态或稍后重试。"
         return 1
       fi
-      if ! ${SUDO} opkg install curl wget socat cron nginx openssl-util; then
+      if ! ${SUDO} opkg install python3 curl wget socat cron nginx openssl-util; then
         error "依赖和 Nginx 安装失败。请检查网络连接、软件源状态或稍后重试。"
         return 1
       fi
@@ -608,7 +609,7 @@ REPO
     ensure_dirs
   fi
 
-  reload_nginx_safe || true
+  reload_nginx_safe || return 1
 
   # 自动安装 acme.sh
   note "安装 acme.sh 证书工具..."
@@ -739,7 +740,7 @@ upgrade_nginx_smart() {
   esac
 
   if nginx_test; then
-    reload_nginx_safe
+    reload_nginx_safe || return 1
     info "Nginx 已平滑升级完成。"
   else
     error "升级后配置校验失败，请检查。备份目录：${backup_dir}"
@@ -904,7 +905,7 @@ mark_conf_manual_edited() {
     echo "# edited=true"
     cat "$conf_file"
   } > "$tmp"
-  install_managed_file "$tmp" "$conf_file"
+  install_managed_file "$tmp" "$conf_file" || { rm -f "$tmp"; return 1; }
   rm -f "$tmp"
 }
 
@@ -1136,355 +1137,6 @@ ensure_cert_for_domain_interactive() {
   return 0
 }
 
-build_proxy_conf() {
-  local domain="$1"
-  local listen_port="$2"
-  local backend_port="$3"
-  local out="$4"
-
-  ensure_websocket_map
-
-  local ipv6_listen
-  ipv6_listen="$(nginx_listen_ipv6_line "$listen_port" "")"
-
-  cat > "$out" <<EOF
-# managed_by=Nginx-X
-# domain=${domain}
-# listen_port=${listen_port}
-# backend_port=${backend_port}
-
-server {
-    listen ${listen_port};
-${ipv6_listen}
-    server_name ${domain};
-
-    # ACME HTTP-01 验证路径（证书申请/续期）
-    location ^~ /.well-known/acme-challenge/ {
-        root /usr/share/nginx/html;
-        default_type "text/plain";
-        try_files \$uri =404;
-    }
-
-    location / {
-        proxy_pass http://127.0.0.1:${backend_port};
-        proxy_http_version 1.1;
-
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Forwarded-Host \$host;
-        proxy_set_header X-Forwarded-Port \$server_port;
-
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
-
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-    }
-}
-EOF
-}
-
-build_external_proxy_conf() {
-  local domain="$1"
-  local listen_port="$2"
-  local upstream_url="$3"
-  local external_mode="$4"
-  local out="$5"
-  local https_enabled="${6:-0}"
-  local stream_upstream_url="${7:-}"
-  local source_site_url="${8:-}"
-  local referer_url="${9:-}"
-
-  ensure_websocket_map
-  local stream_upstream_urls="${10:-}"
-  local main_stream_block=""
-  local stream_location_block=""
-  local lily_block=""
-  local redirect_block=""
-  local main_host_block=""
-  local main_header_block=""
-  local stream_sni_block=""
-  local redirect_suffix=""
-  local upstream_host https_meta https_cert_block
-  local -a stream_urls=()
-  local idx stream_url stream_path stream_host_line stream_redirect_block=""
-  local stream_lily_block="" base_lily_block=""
-
-  upstream_host="$(url_host "$upstream_url")"
-
-  # 非标端口（非 443）时，重写回本机的目标 URL 必须带上端口后缀，
-  # 否则 sub_filter / proxy_redirect 会把推流地址改写成 https://domain（默认 443），
-  # 客户端在 8443 之类端口访问时拿到不可达地址，导致播放流量绕过反代直连源站。
-  local domain_port_suffix=""
-  if [[ "$listen_port" != "443" && "$listen_port" != "80" ]]; then
-    domain_port_suffix=":${listen_port}"
-  fi
-
-  if [[ -n "$stream_upstream_urls" ]]; then
-    stream_urls=()
-    stream_urls_to_array "$stream_upstream_urls" stream_urls
-  elif [[ -n "$stream_upstream_url" ]]; then
-    stream_urls=("$stream_upstream_url")
-  fi
-
-  if [[ ${#stream_urls[@]} -gt 0 ]]; then
-    stream_upstream_url="${stream_urls[0]}"
-    stream_upstream_urls="$(IFS='|'; echo "${stream_urls[*]}")"
-  fi
-
-  [[ -z "$source_site_url" ]] && source_site_url="$upstream_url"
-  [[ -z "$referer_url" && -n "$source_site_url" ]] && referer_url="$(default_referer_from_url "$source_site_url")"
-
-  https_meta=""
-  https_cert_block=""
-  if [[ "$https_enabled" == "1" ]]; then
-    https_meta="# https_enabled=true"
-    https_cert_block=$(cat <<EOF
-    ssl_certificate     ${SSL_DIR}/${domain}/fullchain.pem;
-    ssl_certificate_key ${SSL_DIR}/${domain}/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers off;
-EOF
-)
-  fi
-
-  case "$external_mode" in
-    media)
-      main_stream_block=$(cat <<'BLOCK'
-        # Stream 转发优化（Emby/Jellyfin 等）
-        proxy_request_buffering off;
-        proxy_buffering off;
-        proxy_max_temp_file_size 0;
-        send_timeout 3600s;
-        client_max_body_size 0;
-BLOCK
-)
-      ;;
-    emby_http|emby_https|emby_lily)
-      if [[ ${#stream_urls[@]} -eq 0 ]]; then
-        stream_urls=("$stream_upstream_url")
-      fi
-
-      for idx in "${!stream_urls[@]}"; do
-        stream_url="${stream_urls[$idx]}"
-        stream_path="/s$((idx + 1))/"
-        stream_host_line="$(url_host "$stream_url")"
-        stream_redirect_block+="        proxy_redirect ${stream_url} https://${domain}${domain_port_suffix}${stream_path};"$'\n'
-
-        if [[ "$external_mode" == "emby_lily" ]]; then
-          stream_lily_block+="        sub_filter '${stream_url}' 'https://${domain}${domain_port_suffix}${stream_path%/}';"$'\n'
-        fi
-
-        stream_sni_block=""
-        if [[ "$external_mode" != "emby_http" ]]; then
-          stream_sni_block=$(cat <<EOF
-        proxy_ssl_server_name on;
-        proxy_ssl_name ${stream_host_line};
-EOF
-)
-        fi
-
-        stream_location_block+=$'\n'
-        stream_location_block+="    location ${stream_path} {"$'\n'
-        stream_location_block+="        rewrite ^${stream_path%/}(/.*)\$ \$1 break;"$'\n'
-        stream_location_block+="        proxy_pass ${stream_url};"$'\n'
-        stream_location_block+="        proxy_http_version 1.1;"$'\n'
-        if [[ -n "$stream_sni_block" ]]; then
-          stream_location_block+="${stream_sni_block}"$'\n'
-        fi
-        stream_location_block+="        proxy_set_header Range \$http_range;"$'\n'
-        stream_location_block+="        proxy_set_header If-Range \$http_if_range;"$'\n'
-        stream_location_block+="        proxy_set_header Referer \"${referer_url}\";"$'\n'
-        stream_location_block+="        proxy_set_header Host \$proxy_host;"$'\n'
-        stream_location_block+=$'\n'
-        stream_location_block+="        proxy_buffering off;"$'\n'
-        stream_location_block+="        proxy_connect_timeout 60s;"$'\n'
-        stream_location_block+="        proxy_read_timeout 300s;"$'\n'
-        stream_location_block+="        proxy_send_timeout 300s;"$'\n'
-        stream_location_block+=$'\n'
-        stream_location_block+="        proxy_set_header X-Real-IP \"\";"$'\n'
-        stream_location_block+="        proxy_set_header X-Forwarded-For \"\";"$'\n'
-        stream_location_block+="        proxy_set_header X-Forwarded-Proto \"\";"$'\n'
-        stream_location_block+="        proxy_set_header X-Forwarded-Host \"\";"$'\n'
-        stream_location_block+="        proxy_set_header Forwarded \"\";"$'\n'
-        stream_location_block+="        proxy_set_header Via \"\";"$'\n'
-        stream_location_block+=$'\n'
-        stream_location_block+="        proxy_hide_header X-Powered-By;"$'\n'
-        stream_location_block+="        proxy_hide_header X-Frame-Options;"$'\n'
-        stream_location_block+="        proxy_hide_header X-Content-Type-Options;"$'\n'
-        stream_location_block+="    }"$'\n'
-      done
-
-      redirect_block="${stream_redirect_block%$'\n'}"
-      if [[ "$external_mode" == "emby_lily" ]]; then
-        redirect_block+=$'\n'
-        redirect_block+="        proxy_redirect ${source_site_url} https://${domain}${domain_port_suffix};"
-        base_lily_block=$(cat <<EOF
-        proxy_set_header Accept-Encoding "";
-        sub_filter_types application/json text/xml text/plain;
-        sub_filter_once off;
-        sub_filter '${source_site_url}' 'https://${domain}${domain_port_suffix}';
-EOF
-)
-        lily_block="${base_lily_block}"$'\n'"${stream_lily_block}"
-      else
-        lily_block="${stream_lily_block}"
-      fi
-
-      ;;
-  esac
-
-  if [[ "$external_mode" =~ ^emby_ ]]; then
-    main_host_block=$(cat <<EOF
-        proxy_set_header Host ${upstream_host};
-        proxy_ssl_name ${upstream_host};
-EOF
-)
-    main_header_block=$(cat <<EOF
-        proxy_set_header Range \$http_range;
-        proxy_set_header If-Range \$http_if_range;
-${redirect_block}
-${lily_block}
-        proxy_set_header X-Real-IP "";
-        proxy_set_header X-Forwarded-For "";
-        proxy_set_header X-Forwarded-Proto "";
-        proxy_set_header X-Forwarded-Host "";
-        proxy_set_header X-Forwarded-Port "";
-        proxy_set_header Forwarded "";
-        proxy_set_header Via "";
-
-        proxy_hide_header X-Powered-By;
-        proxy_hide_header X-Frame-Options;
-        proxy_hide_header X-Content-Type-Options;
-EOF
-)
-  else
-    # shellcheck disable=SC2016
-    main_host_block='        proxy_set_header Host $proxy_host;'
-    main_header_block=$(cat <<'EOF'
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Forwarded-Host $host;
-        proxy_set_header X-Forwarded-Port $server_port;
-EOF
-)
-    if [[ -n "$main_stream_block" ]]; then
-      main_header_block="${main_stream_block}
-
-${main_header_block}"
-    fi
-  fi
-
-  if [[ "$listen_port" == "443" ]]; then
-    redirect_suffix=""
-  else
-    redirect_suffix=":${listen_port}"
-  fi
-
-  if [[ "$https_enabled" == "1" ]]; then
-    local ipv6_listen_80 ipv6_listen_tls
-    ipv6_listen_80="$(nginx_listen_ipv6_line 80 "")"
-    ipv6_listen_tls="$(nginx_listen_ipv6_line "$listen_port" "ssl http2")"
-
-    cat > "$out" <<EOF
-# managed_by=Nginx-X
-# mode=external
-# external_mode=${external_mode}
-# domain=${domain}
-# listen_port=${listen_port}
-${https_meta}
-# upstream_url=${upstream_url}
-# stream_upstream_url=${stream_upstream_url}
-# stream_upstream_urls=${stream_upstream_urls}
-# source_site_url=${source_site_url}
-# referer_url=${referer_url}
-
-server {
-    listen 80;
-${ipv6_listen_80}
-    server_name ${domain};
-
-    location ^~ /.well-known/acme-challenge/ {
-        root /usr/share/nginx/html;
-        default_type "text/plain";
-        try_files \$uri =404;
-    }
-
-    return 301 https://\$host${redirect_suffix}\$request_uri;
-}
-
-server {
-    listen ${listen_port} ssl http2;
-${ipv6_listen_tls}
-    server_name ${domain};
-
-${https_cert_block}
-
-    location / {
-        proxy_pass ${upstream_url};
-        proxy_http_version 1.1;
-${main_host_block}
-        proxy_ssl_server_name on;
-
-${main_header_block}
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
-
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-    }
-${stream_location_block}
-}
-EOF
-  else
-    local ipv6_listen_plain
-    ipv6_listen_plain="$(nginx_listen_ipv6_line "$listen_port" "")"
-
-    cat > "$out" <<EOF
-# managed_by=Nginx-X
-# mode=external
-# external_mode=${external_mode}
-# domain=${domain}
-# listen_port=${listen_port}
-# upstream_url=${upstream_url}
-# stream_upstream_url=${stream_upstream_url}
-# stream_upstream_urls=${stream_upstream_urls}
-# source_site_url=${source_site_url}
-# referer_url=${referer_url}
-
-server {
-    listen ${listen_port};
-${ipv6_listen_plain}
-    server_name ${domain};
-
-    location ^~ /.well-known/acme-challenge/ {
-        root /usr/share/nginx/html;
-        default_type "text/plain";
-        try_files \$uri =404;
-    }
-
-    location / {
-        proxy_pass ${upstream_url};
-        proxy_http_version 1.1;
-${main_host_block}
-        proxy_ssl_server_name on;
-
-${main_header_block}
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
-
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-    }
-${stream_location_block}
-}
-EOF
-  fi
-}
-
 # 若配置包含 ssl 监听，则必须同时包含证书指令，避免生成半截 HTTPS 配置
 ensure_ssl_directives_present() {
   local conf_file="$1"
@@ -1503,61 +1155,6 @@ ensure_ssl_directives_present() {
       return 1
     fi
   fi
-}
-
-apply_conf_with_rollback() {
-  # 参数：临时文件、目标文件
-  local tmp_conf="$1"
-  local target_conf="$2"
-  local backup
-  local test_output=""
-
-  backup="${target_conf}.rollback.$(date +%s)"
-
-  if [[ -f "$target_conf" ]]; then
-    ${SUDO} cp -a "$target_conf" "$backup"
-  fi
-
-  install_managed_file "$tmp_conf" "$target_conf"
-
-  if ! ensure_ssl_directives_present "$target_conf"; then
-    if [[ -f "$backup" ]]; then
-      ${SUDO} cp -a "$backup" "$target_conf"
-      ${SUDO} rm -f "$backup"
-    else
-      ${SUDO} rm -f "$target_conf"
-    fi
-    return 1
-  fi
-
-  if test_output="$(${SUDO} nginx -t 2>&1)"; then
-    if reload_nginx_safe; then
-      [[ -f "$backup" ]] && ${SUDO} rm -f "$backup"
-      domain_only_after_apply
-      return 0
-    fi
-
-    if [[ -f "$backup" ]]; then
-      ${SUDO} cp -a "$backup" "$target_conf"
-      ${SUDO} rm -f "$backup"
-    else
-      ${SUDO} rm -f "$target_conf"
-    fi
-    reload_nginx_safe >/dev/null 2>&1 || true
-    error "Nginx 重载失败，已自动撤销本次修改。"
-    return 1
-  fi
-
-  # 回滚
-  if [[ -f "$backup" ]]; then
-    ${SUDO} cp -a "$backup" "$target_conf"
-    ${SUDO} rm -f "$backup"
-  else
-    ${SUDO} rm -f "$target_conf"
-  fi
-  error "配置测试失败，已自动撤销本次修改。请根据上面的 nginx -t 输出检查具体报错。"
-  echo "$test_output"
-  return 1
 }
 
 add_reverse_proxy() {
@@ -1669,6 +1266,9 @@ add_reverse_proxy() {
         fi
       fi
     fi
+  else
+    rm -f "$tmp"
+    return 1
   fi
   rm -f "$tmp"
 }
@@ -1802,8 +1402,10 @@ add_external_url_proxy() {
         fi
       fi
     fi
+  else
+    rm -f "$tmp"
+    return 1
   fi
-
   rm -f "$tmp"
 }
 
@@ -1848,73 +1450,17 @@ print_conf_list() {
   fi
 
   echo "可管理配置列表："
+  local f domain ports tls policy status
   for f in "${FILES[@]}"; do
-    if [[ "$f" =~ \.conf$ ]]; then
-      echo "  ${i}) ${f}  [已启用]"
-    else
-      echo "  ${i}) ${f}  [已停用]"
-    fi
-    ((i++))
+    domain="$(extract_domain_from_conf "$CONF_DIR/$f")"
+    ports="$(sed -nE 's/^[[:space:]]*listen[[:space:]]+([^ ;]+).*$/\1/p' "$CONF_DIR/$f" | sort -u | tr '\n' ',')"
+    tls="HTTP"; conf_https_enabled "$CONF_DIR/$f" && tls="HTTPS"
+    policy="$(conf_meta_get "$CONF_DIR/$f" access_policy)"; policy="${policy:-inherit}"
+    status="已停用"; [[ "$f" == *.conf ]] && status="已启用"
+    echo "  ${i}) ${domain:-未知域名} | ${ports%,} | ${tls} | ${policy} | ${status} | ${f}"
+    ((i+=1))
   done
   return 0
-}
-
-enable_conf() {
-  local file src dst
-  file="${1:-}"
-  if [[ -z "$file" ]]; then
-    error "未指定配置文件。"
-    return 1
-  fi
-  src="${CONF_DIR}/${file}"
-
-  if [[ "$file" =~ \.conf$ ]]; then
-    warn "该配置已是启用状态。"
-    return 0
-  fi
-
-  dst="${src%%.bak}"
-  ${SUDO} mv "$src" "$dst"
-
-  if nginx_test; then
-    reload_nginx_safe
-    info "已启用：$(basename "$dst")"
-    domain_only_rebuild_if_enabled || true
-  else
-    ${SUDO} mv "$dst" "$src"
-    error "启用后配置校验失败，已回滚。"
-    ${SUDO} nginx -t || true
-    return 1
-  fi
-}
-
-disable_conf() {
-  local file src dst
-  file="${1:-}"
-  if [[ -z "$file" ]]; then
-    error "未指定配置文件。"
-    return 1
-  fi
-  src="${CONF_DIR}/${file}"
-
-  if [[ ! "$file" =~ \.conf$ ]]; then
-    warn "该配置已是停用状态。"
-    return 0
-  fi
-
-  dst="${src}.bak"
-  ${SUDO} mv "$src" "$dst"
-
-  if nginx_test; then
-    reload_nginx_safe
-    info "已停用：$(basename "$dst")"
-    domain_only_rebuild_if_enabled || true
-  else
-    ${SUDO} mv "$dst" "$src"
-    error "停用后配置校验失败，已回滚。"
-    ${SUDO} nginx -t || true
-    return 1
-  fi
 }
 
 modify_conf() {
@@ -1986,26 +1532,18 @@ modify_conf() {
 
   # 修改后默认写入 .conf；也可选择立即停用
   new_target="$(conf_target_path "$new_domain" "$new_listen")"
-  if apply_conf_with_rollback "$tmp" "$new_target"; then
-    # 若原文件名和新文件名不同，且原文件仍存在则清理
-    if [[ "$src" != "$new_target" && -f "$src" ]]; then
-      ${SUDO} rm -f "$src"
-    fi
-    domain_only_rebuild_if_enabled || true
+  [[ "$src" == *.conf.bak ]] && new_target="${new_target}.bak"
+  if apply_conf_with_rollback "$tmp" "$new_target" "$src"; then
 
+    if [[ "$new_target" == *.bak ]]; then
+      info "配置已修改，保持停用状态。"
+      rm -f "$tmp"
+      return 0
+    fi
     info "配置已修改并生效。"
 
     if ! confirm "是否立即启用该配置？"; then
-      ${SUDO} mv "$new_target" "${new_target}.bak"
-      if nginx_test; then
-        reload_nginx_safe
-        info "配置已保存并停用，可稍后在配置列表中启用。"
-        domain_only_rebuild_if_enabled || true
-      else
-        ${SUDO} mv "${new_target}.bak" "$new_target"
-        error "停用失败，已恢复启用状态。"
-        ${SUDO} nginx -t || true
-      fi
+      disable_conf "$(basename "$new_target")" || { rm -f "$tmp"; return 1; }
       rm -f "$tmp"
       return 0
     fi
@@ -2040,6 +1578,9 @@ modify_conf() {
         fi
       fi
     fi
+  else
+    rm -f "$tmp"
+    return 1
   fi
 
   rm -f "$tmp"
@@ -2178,15 +1719,17 @@ modify_external_conf() {
   fi
 
   new_target="$(conf_target_path "$new_domain" "$desired_port")"
+  (( was_disabled == 0 )) || new_target="${new_target}.bak"
   tmp="$(mktemp /tmp/nginxx-external-mod-"${new_domain}"-XXXXXX)"
   trap 'rm -f "${tmp:-}"' RETURN
   build_external_proxy_conf "$new_domain" "$create_port" "$new_upstream_url" "$new_mode" "$tmp" "0" "$new_stream_upstream_url" "$new_source_site_url" "$new_referer_url" "$new_stream_upstream_urls"
 
-  if apply_conf_with_rollback "$tmp" "$new_target"; then
-    if [[ "$src" != "$new_target" && -f "$src" ]]; then
-      ${SUDO} rm -f "$src"
+  if apply_conf_with_rollback "$tmp" "$new_target" "$src"; then
+    if (( was_disabled == 1 )); then
+      info "配置已修改，保持停用状态。"
+      rm -f "$tmp"
+      return 0
     fi
-    domain_only_rebuild_if_enabled || true
 
     if [[ "$force_enable_https" == "1" || "$was_https_enabled" == "1" ]]; then
       if [[ ! -f "${SSL_DIR}/${new_domain}/fullchain.pem" || ! -f "${SSL_DIR}/${new_domain}/privkey.pem" ]]; then
@@ -2212,96 +1755,12 @@ modify_external_conf() {
       fi
     fi
 
-    if (( was_disabled == 1 )); then
-      ${SUDO} mv "$new_target" "${new_target}.bak"
-      if nginx_test; then
-        reload_nginx_safe
-        info "原配置处于停用状态，已保持为停用。"
-        domain_only_rebuild_if_enabled || true
-      else
-        ${SUDO} mv "${new_target}.bak" "$new_target"
-        error "恢复停用状态失败，已恢复为启用配置。"
-        ${SUDO} nginx -t || true
-        return 1
-      fi
-    fi
+  else
+    rm -f "$tmp"
+    return 1
   fi
 
   rm -f "$tmp"
-}
-
-delete_conf() {
-  local file target
-  file="${1:-}"
-  if [[ -z "$file" ]]; then
-    error "未指定配置文件。"
-    return 1
-  fi
-  target="${CONF_DIR}/${file}"
-
-  if ! confirm "确认永久删除 ${file} ?"; then
-    info "已取消删除。"
-    return 0
-  fi
-
-  # 先删，再校验，失败则无法自动恢复（所以先备份）
-  local backup
-  backup="${target}.delbak.$(date +%s)"
-  ${SUDO} cp -a "$target" "$backup"
-  ${SUDO} rm -f "$target"
-
-  if nginx_test; then
-    reload_nginx_safe
-    ${SUDO} rm -f "$backup"
-    info "已删除：${file}"
-    domain_only_rebuild_if_enabled || true
-  else
-    ${SUDO} cp -a "$backup" "$target"
-    ${SUDO} rm -f "$backup"
-    error "删除后配置失败，已恢复文件。"
-    ${SUDO} nginx -t || true
-    return 1
-  fi
-}
-
-edit_conf_manual() {
-  local file target backup
-  file="${1:-}"
-  if [[ -z "$file" ]]; then
-    error "未指定配置文件。"
-    return 1
-  fi
-
-  target="${CONF_DIR}/${file}"
-  if [[ ! -f "$target" ]]; then
-    error "配置文件不存在：${target}"
-    return 1
-  fi
-
-  backup="${target}.editbak.$(date +%s)"
-  ${SUDO} cp -a "$target" "$backup"
-
-  if ! run_editor "$target"; then
-    ${SUDO} cp -a "$backup" "$target"
-    ${SUDO} rm -f "$backup"
-    error "编辑器启动失败，已恢复原配置。"
-    return 1
-  fi
-
-  mark_conf_manual_edited "$target"
-
-  if nginx_test; then
-    reload_nginx_safe
-    ${SUDO} rm -f "$backup"
-    info "配置已编辑并生效：${file}"
-    domain_only_rebuild_if_enabled || true
-  else
-    ${SUDO} cp -a "$backup" "$target"
-    ${SUDO} rm -f "$backup"
-    error "编辑后配置校验失败，已回滚到修改前。"
-    ${SUDO} nginx -t || true
-    return 1
-  fi
 }
 
 config_file_action_menu() {
@@ -2315,6 +1774,9 @@ config_file_action_menu() {
     echo "3) 修改"
     echo "4) 编辑"
     echo "5) 删除"
+    echo "6) 域名访问限制（继承全局 / 严格域名）"
+    echo "7) HTTPS 开关"
+    echo "8) 站点健康检查"
     echo "0) 返回上一级"
     echo "============================"
     read -rp "请选择: " c
@@ -2325,8 +1787,11 @@ config_file_action_menu() {
       3) run_menu_action modify_conf "$file"; pause; return 0 ;;
       4) run_menu_action edit_conf_manual "$file"; pause; return 0 ;;
       5) run_menu_action delete_conf "$file"; pause; return 0 ;;
+      6) run_menu_action nx_site_access_menu "$CONF_DIR/$file"; pause ;;
+      7) run_menu_action nx_site_https_toggle "$CONF_DIR/$file"; pause ;;
+      8) run_menu_action health_check_conf_file "$CONF_DIR/$file"; pause ;;
       0) return 0 ;;
-      *) warn "无效输入。请输入 0-5 之间的菜单编号。"; pause ;;
+      *) warn "无效输入。请输入 0-8 之间的菜单编号。"; pause ;;
     esac
   done
 }
@@ -2475,7 +1940,7 @@ import_single_conf() {
   local conf="$1"
   local meta domain listen_port backend_url https_enabled mode
   local target_name target_path tmp
-  local real_conf backup_conf="" target_written=""
+  local real_conf
   local -a removed_links=()
 
   meta="$(_extract_conf_meta "$conf")"
@@ -2531,63 +1996,29 @@ import_single_conf() {
   real_conf="$(realpath "$conf" 2>/dev/null || echo "$conf")"
 
   if [[ "$real_conf" == "${CONF_DIR}/"* ]]; then
-    # 原文件就在 conf.d 里，直接原地加元数据头
-    backup_conf="$(mktemp /tmp/nginxx-import-backup-XXXXXX)"
-    ${SUDO} cp -a "$real_conf" "$backup_conf"
-    install_managed_file "$tmp" "$real_conf"
-    target_written="$real_conf"
-    # 如果文件名不符合 domain-port.conf 规范，重命名
-    if [[ "$(basename "$real_conf")" != "$target_name" && ! -f "$target_path" ]]; then
-      ${SUDO} mv "$real_conf" "$target_path"
-      target_written="$target_path"
-    fi
-
-    if ! nginx_test; then
-      [[ -n "$target_written" && "$target_written" != "$real_conf" ]] && ${SUDO} rm -f "$target_written"
-      ${SUDO} cp -a "$backup_conf" "$real_conf"
-      rm -f "$tmp" "$backup_conf"
-      error "导入后配置校验失败，已回滚：${conf}"
-      ${SUDO} nginx -t || true
+    if [[ "$real_conf" != "$target_path" && -e "$target_path" ]]; then target_path="$real_conf"; fi
+    if ! apply_conf_with_rollback "$tmp" "$target_path" "$real_conf"; then
+      rm -f "$tmp"
       return 1
     fi
-    rm -f "$backup_conf"
   else
-    # 来自 sites-available / sites-enabled，复制到 conf.d
-    install_managed_file "$tmp" "$target_path"
-    target_written="$target_path"
-
-    # 移除 sites-enabled 中对应的软链接（避免重复加载）
-    local enabled_link
+    [[ ! -e "$target_path" ]] || { rm -f "$tmp"; error "目标配置已存在。"; return 1; }
+    local enabled_link link_target
     for enabled_link in /etc/nginx/sites-enabled/*; do
       [[ -L "$enabled_link" ]] || continue
-      local link_target
       link_target="$(realpath "$enabled_link" 2>/dev/null || true)"
       if [[ "$link_target" == "$real_conf" ]]; then
-        ${SUDO} rm -f "$enabled_link"
+        ${SUDO} rm -f "$enabled_link" || { rm -f "$tmp"; return 1; }
         removed_links+=("$enabled_link")
-        info "已移除 sites-enabled 软链接：$(basename "$enabled_link")"
       fi
     done
-
-    if ! nginx_test; then
-      ${SUDO} rm -f "$target_written"
-      local removed_link
-      for removed_link in "${removed_links[@]}"; do
-        ${SUDO} ln -s "$real_conf" "$removed_link" 2>/dev/null || true
-      done
+    if ! apply_conf_with_rollback "$tmp" "$target_path"; then
+      for enabled_link in "${removed_links[@]}"; do ${SUDO} ln -s "$real_conf" "$enabled_link" || true; done
+      reload_nginx_safe >/dev/null 2>&1 || true
       rm -f "$tmp"
-      error "导入后配置校验失败，已回滚：${conf}"
-      ${SUDO} nginx -t || true
       return 1
     fi
-
-    # 导入成功后询问是否删除原文件
-    if confirm "是否删除原始配置文件 ${real_conf}？（推荐删除，避免重复扫描）"; then
-      ${SUDO} rm -f "$real_conf"
-      info "已删除原始文件：${real_conf}"
-    else
-      note "原始文件保留在：${real_conf}"
-    fi
+    note "原始文件保留在：${real_conf}（已解除 sites-enabled 重复链接）"
   fi
 
   rm -f "$tmp"
@@ -2618,7 +2049,7 @@ import_existing_confs() {
     echo "    域名: ${domain}  端口: ${listen_port}"
     if confirm "    是否导入此配置？"; then
       if import_single_conf "$conf"; then
-        ((imported++))
+        ((imported+=1))
       fi
     else
       info "    已跳过。"
@@ -2628,13 +2059,7 @@ import_existing_confs() {
 
   if [[ $imported -gt 0 ]]; then
     info "共导入 ${imported} 个配置。"
-    # 验证整体配置
-    if ${SUDO} nginx -t 2>&1; then
-      reload_nginx_safe
-      domain_only_rebuild_if_enabled || true
-    else
-      warn "导入后 nginx -t 测试未通过，请检查配置。"
-    fi
+
   fi
 }
 
@@ -2690,7 +2115,7 @@ dns_setup_menu() {
         read -rp "请输入备用 DNS (可留空): " ns2
         ;;
       0) return 0 ;;
-      *) warn "无效输入。请输入 0-5 之间的菜单编号。"; pause; continue ;;
+      *) warn "无效输入。请输入 0-8 之间的菜单编号。"; pause; continue ;;
     esac
 
     if [[ -z "$ns1" ]]; then
@@ -2757,7 +2182,7 @@ config_entry_menu() {
     echo "3) 配置列表"
     echo "4) 导入已有配置"
     echo "5) 系统DNS设置"
-    echo "6) 仅域名访问（隐藏IP）"
+    echo "6) 域名访问限制"
     echo "0) 返回上一级"
     echo "=============================="
     read -rp "请选择: " c
@@ -2778,867 +2203,6 @@ config_entry_menu() {
 # ---------- 功能5：证书管理（acme.sh） ----------
 
 # --- DNS-01 配置 ---
-load_dns_conf() {
-  ensure_state_dir
-  if [[ -f "$DNS_CONF" ]]; then
-    # shellcheck disable=SC1090
-    . "$DNS_CONF"
-  fi
-}
-
-save_dns_conf() {
-  local provider="$1"
-  local key1="$2"
-  local key2="$3"
-  ensure_state_dir
-  # 密钥属于敏感信息，先设置只读权限再写入，避免明文密钥被同机其他用户读到。
-  (
-    umask 077
-    {
-      printf 'DNS_PROVIDER=%q\n' "$provider"
-      printf 'DNS_KEY1=%q\n' "$key1"
-      printf 'DNS_KEY2=%q\n' "$key2"
-    } > "$DNS_CONF"
-  )
-  chmod 600 "$DNS_CONF" 2>/dev/null || true
-  info "DNS API 配置已保存到：${DNS_CONF}（权限 600）。"
-  warn "提醒：DNS API 密钥以明文存储于该文件，请自行保护该主机的账户权限。"
-}
-
-has_dns_config() {
-  load_dns_conf
-  [[ -n "${DNS_PROVIDER:-}" && -n "${DNS_KEY1:-}" ]]
-}
-
-get_dns_issue_args() {
-  load_dns_conf
-  case "${DNS_PROVIDER:-}" in
-    cf|cloudflare)
-      echo "--dns dns_cf"
-      ;;
-    dp|dnspod)
-      echo "--dns dns_dp"
-      ;;
-    ali|alidns)
-      echo "--dns dns_ali"
-      ;;
-    he|he.net)
-      echo "--dns dns_he"
-      ;;
-    gd|godaddy)
-      echo "--dns dns_gd"
-      ;;
-    hw|huaweicloud)
-      echo "--dns dns_huaweicloud"
-      ;;
-    aws|route53)
-      echo "--dns dns_aws"
-      ;;
-    google|gcp)
-      echo "--dns dns_gcloud"
-      ;;
-    *)
-      echo ""
-      ;;
-  esac
-}
-
-setup_dns_api() {
-  local choice provider key1 key2
-  echo "选择 DNS 服务商："
-  echo "1)  Cloudflare      (CF_Token)"
-  echo "2)  DNSPod          (DP_Id + DP_Key)"
-  echo "3)  阿里云 DNS      (Ali_Key + Ali_Secret)"
-  echo "4)  HE.net          (HE_Username + HE_Password)"
-  echo "5)  GoDaddy         (GD_Key + GD_Secret)"
-  echo "6)  华为云          (HUAWEICLOUD_Username + HUAWEICLOUD_Password)"
-  echo "7)  AWS Route53     (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY)"
-  echo "8)  Google Cloud    (GCE_Project + GCE_ServiceAccountEmail)"
-  read -rp "请选择 [1-8]: " choice
-
-  case "$choice" in
-    1) provider="cf"; read -rp "Cloudflare API Token: " key1 ;;
-    2) provider="dp"; read -rp "DNSPod ID: " key1; read -rp "DNSPod Key: " key2 ;;
-    3) provider="ali"; read -rp "Aliyun AccessKey ID: " key1; read -rp "Aliyun AccessKey Secret: " key2 ;;
-    4) provider="he"; read -rp "HE.net Username: " key1; read -rp "HE.net Password: " key2 ;;
-    5) provider="gd"; read -rp "GoDaddy API Key: " key1; read -rp "GoDaddy API Secret: " key2 ;;
-    6) provider="hw"; read -rp "华为云 Username: " key1; read -rp "华为云 Password: " key2 ;;
-    7) provider="aws"; read -rp "AWS Access Key ID: " key1; read -rp "AWS Secret Access Key: " key2 ;;
-    8) provider="google"; read -rp "GCE Project: " key1; read -rp "Service Account Email: " key2 ;;
-    *) error "无效选择。"; return 1 ;;
-  esac
-  [[ -z "$key1" ]] && { error "API Key 不能为空。"; return 1; }
-
-  save_dns_conf "$provider" "$key1" "${key2:-}"
-
-  # Export env vars for acme.sh
-  case "$provider" in
-    cf) export CF_Token="$key1" ;;
-    dp) export DP_Id="$key1"; export DP_Key="$key2" ;;
-    ali) export Ali_Key="$key1"; export Ali_Secret="$key2" ;;
-    he) export HE_Username="$key1"; export HE_Password="$key2" ;;
-    gd) export GD_Key="$key1"; export GD_Secret="$key2" ;;
-    hw) export HUAWEICLOUD_Username="$key1"; export HUAWEICLOUD_Password="$key2" ;;
-    aws) export AWS_ACCESS_KEY_ID="$key1"; export AWS_SECRET_ACCESS_KEY="$key2" ;;
-    google) export GCE_Project="$key1"; export GCE_ServiceAccountEmail="$key2" ;;
-  esac
-
-  info "DNS API 配置完成（${provider}）。"
-  if confirm "是否现在测试申请证书？"; then
-    local test_domain
-    read -rp "请输入测试域名: " test_domain
-    if valid_domain "$test_domain"; then
-      _issue_cert_dns "$test_domain"
-    fi
-  fi
-}
-
-export_dns_env() {
-  load_dns_conf
-  # DNS_KEY1/DNS_KEY2 are sourced from $DNS_CONF by load_dns_conf; shellcheck can't see the assignment.
-  # shellcheck disable=SC2153
-  case "${DNS_PROVIDER:-}" in
-    cf) export CF_Token="${DNS_KEY1}" ;;
-    dp) export DP_Id="${DNS_KEY1}"; export DP_Key="${DNS_KEY2}" ;;
-    ali) export Ali_Key="${DNS_KEY1}"; export Ali_Secret="${DNS_KEY2}" ;;
-    he) export HE_Username="${DNS_KEY1}"; export HE_Password="${DNS_KEY2}" ;;
-    gd) export GD_Key="${DNS_KEY1}"; export GD_Secret="${DNS_KEY2}" ;;
-    hw) export HUAWEICLOUD_Username="${DNS_KEY1}"; export HUAWEICLOUD_Password="${DNS_KEY2}" ;;
-    aws) export AWS_ACCESS_KEY_ID="${DNS_KEY1}"; export AWS_SECRET_ACCESS_KEY="${DNS_KEY2}" ;;
-    google) export GCE_Project="${DNS_KEY1}"; export GCE_ServiceAccountEmail="${DNS_KEY2}" ;;
-  esac
-}
-
-detect_cert_mode() {
-  # 返回 http 或 dns（自动检测最适合的验证方式）
-  # NAT 机没有 80 端口时自动返回 dns
-  if ss -lnt 2>/dev/null | awk 'NR>1{print $4}' | grep -qE '(^|:)80$'; then
-    echo "http"
-  elif has_dns_config; then
-    echo "dns"
-  else
-    echo "http"
-  fi
-}
-
-select_cert_mode_interactive() {
-  # 交互式选择证书验证方式，返回 "http" 或 "dns"
-  # 注意：此函数被 $(...) 调用，所有用户提示必须输出到 stderr 才能显示
-  local choice=""
-  >&2 echo "Select cert verification method:"
-  >&2 echo "1) HTTP-01  (requires port 80 reachable)"
-  >&2 echo "2) DNS-01   (requires DNS API Token, for NAT/no-port80)"
-
-  local default_choice="1"
-  if ! ss -lnt 2>/dev/null | awk 'NR>1{print $4}' | grep -qE '(^|:)80$'; then
-    >&2 warn "Port 80 not detected, DNS-01 suggested."
-    default_choice="2"
-  fi
-
-  read -rp "Choose [1-2] (default ${default_choice}): " choice
-  [[ -z "$choice" ]] && choice="$default_choice"
-
-  case "$choice" in
-    2)
-      if ! has_dns_config; then
-        >&2 warn "DNS API Token not configured, please set up first."
-        if ! setup_dns_api >&2; then
-          >&2 error "DNS API setup failed, fallback to HTTP-01."
-          echo "http"
-          return 0
-        fi
-      fi
-      echo "dns"
-      ;;
-    *)
-      echo "http"
-      ;;
-  esac
-}
-
-_issue_cert_dns() {
-  local domain="$1"
-  local dns_args issue_output retry_after
-
-  load_email
-  if [[ -z "${ACME_EMAIL:-}" ]]; then
-    error "未设置邮箱，无法申请证书。"
-    return 1
-  fi
-
-  if ! has_dns_config; then
-    error "未配置 DNS API。请先在证书管理里执行 [3) 配置 DNS API]。"
-    return 1
-  fi
-
-  dns_args="$(get_dns_issue_args)"
-  if [[ -z "$dns_args" ]]; then
-    error "不支持的 DNS 服务商配置，请重新设置。"
-    return 1
-  fi
-
-  ensure_acme_installed || return 1
-
-  note "开始为 ${domain} 申请证书（DNS-01 验证）..."
-  export_dns_env
-  "$HOME/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-  "$HOME/.acme.sh/acme.sh" --register-account -m "$ACME_EMAIL" >/dev/null 2>&1 || true
-
-  # dns_args holds acme.sh flags like "--dns dns_cf" and must word-split into two args.
-  # shellcheck disable=SC2086
-  issue_output="$("$HOME/.acme.sh/acme.sh" --issue -d "$domain" $dns_args 2>&1)" || {
-    echo "$issue_output"
-    if echo "$issue_output" | grep -qi 'rateLimited\|too many certificates'; then
-      retry_after="$(echo "$issue_output" | sed -n 's/.*retry after \([^:]*UTC\).*/\1/p' | head -n1)"
-      error "证书申请失败：触发 Let's Encrypt 频率限制（429）。"
-      [[ -n "$retry_after" ]] && warn "可重试时间（UTC）：$retry_after"
-    elif echo "$issue_output" | grep -qi 'verify error\|dns.*fail\|NXDOMAIN\|SERVFAIL'; then
-      error "DNS 验证失败。请确认：1) DNS API 密钥正确 2) 域名 DNS 托管在所选服务商 3) 域名已正确解析。"
-    else
-      error "证书申请失败。请检查 DNS API 配置和网络连接。"
-    fi
-    return 1
-  }
-
-  ${SUDO} mkdir -p "${SSL_DIR}/${domain}"
-  "$HOME/.acme.sh/acme.sh" --install-cert -d "$domain" \
-    --key-file "${SSL_DIR}/${domain}/privkey.pem" \
-    --fullchain-file "${SSL_DIR}/${domain}/fullchain.pem"
-
-  ensure_acme_cron
-  info "证书申请并安装成功（DNS-01）。"
-}
-
-_issue_cert_http() {
-  # 原有的 HTTP-01 逻辑
-  local domain="$1"
-  local challenge_conf
-
-  ensure_acme_location_for_domain_conf "$domain" || return 1
-  challenge_conf="$(ensure_http_challenge_server "$domain")"
-
-  if ! reload_nginx_safe; then
-    cleanup_http_challenge_server "$challenge_conf"
-    error "证书申请前校验失败：Nginx 配置未生效。"
-    return 1
-  fi
-
-  local pre_rc=0
-  if precheck_http01 "$domain"; then
-    pre_rc=0
-  else
-    pre_rc=$?
-  fi
-  if (( pre_rc != 0 )); then
-    if [[ $pre_rc -eq 10 ]]; then
-      if ! confirm "自检存在风险，是否仍继续申请证书？"; then
-        cleanup_http_challenge_server "$challenge_conf"
-        reload_nginx_safe || true
-        info "已取消申请。"
-        return 1
-      fi
-      warn "你选择继续申请，将直接尝试签发。"
-    else
-      if has_dns_config; then
-        warn "HTTP-01 自检失败，是否改用 DNS-01 方式申请？"
-        if confirm "使用 DNS-01 方式？"; then
-          cleanup_http_challenge_server "$challenge_conf"
-          reload_nginx_safe || true
-          _issue_cert_dns "$domain"
-          return $?
-        fi
-      fi
-      if ! confirm "自检失败（建议先修复），是否仍强制继续申请？"; then
-        cleanup_http_challenge_server "$challenge_conf"
-        reload_nginx_safe || true
-        info "已取消申请。"
-        return 1
-      fi
-      warn "你选择强制继续申请。"
-    fi
-  fi
-
-  ensure_acme_installed || return 1
-
-  note "开始为 ${domain} 申请证书（HTTP 验证）..."
-  "$HOME/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-  "$HOME/.acme.sh/acme.sh" --register-account -m "$ACME_EMAIL" >/dev/null 2>&1 || true
-
-  local issue_output retry_after
-  issue_output="$("$HOME/.acme.sh/acme.sh" --issue -d "$domain" --webroot /usr/share/nginx/html 2>&1)" || {
-    echo "$issue_output"
-    cleanup_http_challenge_server "$challenge_conf"
-    reload_nginx_safe || true
-
-    if echo "$issue_output" | grep -qi 'rateLimited\|too many certificates'; then
-      retry_after="$(echo "$issue_output" | sed -n 's/.*retry after \([^:]*UTC\).*/\1/p' | head -n1)"
-      error "证书申请失败：触发 Let's Encrypt 频率限制（429）。"
-      [[ -n "$retry_after" ]] && warn "可重试时间（UTC）：$retry_after"
-      warn "这是 CA 侧限制，不是你服务器或端口配置问题。"
-    else
-      error "证书申请失败。请确认域名已解析到本机、80 端口已放行，且没有被 CDN/防火墙拦截。"
-      if has_dns_config; then
-        warn "你已配置 DNS API，可前往主菜单选择 [3) 配置 DNS API] 后使用 DNS 方式申请。"
-      fi
-    fi
-    return 1
-  }
-
-  cleanup_http_challenge_server "$challenge_conf"
-  reload_nginx_safe || true
-
-  ${SUDO} mkdir -p "${SSL_DIR}/${domain}"
-  "$HOME/.acme.sh/acme.sh" --install-cert -d "$domain" \
-    --key-file "${SSL_DIR}/${domain}/privkey.pem" \
-    --fullchain-file "${SSL_DIR}/${domain}/fullchain.pem"
-
-  ensure_acme_cron
-  info "证书申请并安装成功。"
-}
-
-load_email() {
-  ensure_state_dir
-  if [[ -f "$EMAIL_CONF" ]]; then
-    # shellcheck disable=SC1090
-    . "$EMAIL_CONF"
-  fi
-}
-
-save_email() {
-  local email="$1"
-  ensure_state_dir
-  ( umask 077
-    printf 'ACME_EMAIL=%q\n' "$email" > "$EMAIL_CONF"
-  )
-  chmod 600 "$EMAIL_CONF"
-  info "邮箱已保存到：${EMAIL_CONF}"
-}
-
-ensure_acme_installed() {
-  local install_script=""
-
-  if [[ -x "$HOME/.acme.sh/acme.sh" ]]; then
-    return 0
-  fi
-
-  note "未检测到 acme.sh，开始安装..."
-
-  install_script="$(mktemp /tmp/acme-install-XXXXXX)"
-  if ! curl -fsSL https://get.acme.sh -o "$install_script"; then
-    cleanup_tmp_file "$install_script"
-    error "acme.sh 安装脚本下载失败，请稍后重试。"
-    return 1
-  fi
-
-  if ! sh "$install_script"; then
-    cleanup_tmp_file "$install_script"
-    error "acme.sh 安装脚本执行失败。"
-    return 1
-  fi
-
-  cleanup_tmp_file "$install_script"
-
-  if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then
-    error "acme.sh 安装失败。"
-    return 1
-  fi
-  info "acme.sh 安装成功。"
-}
-
-ensure_acme_cron() {
-  local cron_line
-  cron_line="0 3 1 */2 * $HOME/.acme.sh/acme.sh --cron --home $HOME/.acme.sh >/dev/null"
-
-  if crontab -l 2>/dev/null | grep -q 'acme.sh --cron'; then
-    info "已检测到 acme.sh 自动续期任务（crontab）。"
-    return 0
-  fi
-
-  # Alpine dcron: try periodic script as fallback
-  if check_cmd dcron || [[ -d /etc/periodic ]]; then
-    local periodic_script="/etc/periodic/monthly/acme-renew"
-    if [[ -f "$periodic_script" ]]; then
-      info "已检测到 acme.sh 自动续期任务（dcron periodic）。"
-      return 0
-    fi
-    warn "未检测到 acme.sh 自动续期任务。"
-    if confirm "是否一键添加自动续期任务（每月执行）？"; then
-      ${SUDO} mkdir -p /etc/periodic/monthly
-      ${SUDO} tee "$periodic_script" >/dev/null <<EOF
-#!/bin/sh
-$HOME/.acme.sh/acme.sh --cron --home $HOME/.acme.sh >/dev/null
-EOF
-      ${SUDO} chmod +x "$periodic_script"
-      info "已添加 acme.sh 自动续期任务（/etc/periodic/monthly/acme-renew）。"
-    else
-      warn "你选择了不添加自动续期任务，后续需手动续期。"
-    fi
-    return 0
-  fi
-
-  # Standard crontab
-  warn "未检测到 acme.sh 自动续期任务。"
-  if confirm "是否一键添加自动续期任务（约每60天执行）？"; then
-    (crontab -l 2>/dev/null; echo "$cron_line") | crontab -
-    info "已开启自动续期任务。"
-  else
-    warn "你选择了不添加自动续期任务，后续需手动续期。"
-  fi
-}
-
-has_acme_cron_task() {
-  crontab -l 2>/dev/null | grep -q 'acme.sh --cron' || \
-    [[ -f /etc/periodic/monthly/acme-renew ]]
-}
-
-disable_acme_cron() {
-  if crontab -l 2>/dev/null | grep -q 'acme.sh --cron'; then
-    crontab -l 2>/dev/null | grep -v 'acme.sh --cron' | crontab - || true
-    info "已关闭 crontab 自动续期任务。"
-  fi
-  if [[ -f /etc/periodic/monthly/acme-renew ]]; then
-    ${SUDO} rm -f /etc/periodic/monthly/acme-renew
-    info "已关闭 dcron periodic 自动续期任务。"
-  fi
-  if ! has_acme_cron_task; then
-    :
-  else
-    warn "清理后仍检测到自动续期任务，请手动检查 crontab 和 periodic 目录。"
-  fi
-}
-
-enable_acme_cron() {
-  ensure_acme_cron
-}
-
-set_acme_email() {
-  local email
-  read -rp "请输入证书通知邮箱: " email
-  if [[ ! "$email" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
-    error "邮箱格式不合法。请输入类似 user@example.com 的邮箱地址。"
-    return 1
-  fi
-  save_email "$email"
-}
-
-ensure_email_interactive() {
-  # 若未设置邮箱，允许在当前界面直接录入并保存
-  load_email
-  if [[ -n "${ACME_EMAIL:-}" ]]; then
-    return 0
-  fi
-
-  warn "当前未设置 Acme 邮箱。"
-  read -rp "请输入邮箱（将保存到 ${EMAIL_CONF}）: " email
-  if [[ ! "$email" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
-    error "邮箱格式不合法。请输入类似 user@example.com 的邮箱地址。"
-    return 1
-  fi
-
-  save_email "$email"
-  # shellcheck disable=SC2034
-  ACME_EMAIL="$email"
-}
-
-ensure_acme_location_for_domain_conf() {
-  # 为已存在的反代配置补齐 ACME 验证 location，避免申请证书时被反代到后端
-  local domain="$1"
-  local -a matches
-  local conf_file tmp_file
-
-  # Collect tmp files so early-return / errors won't leak /tmp files
-  local -a tmp_files=()
-  trap 'for f in "${tmp_files[@]}"; do rm -f "$f" 2>/dev/null || true; done' RETURN
-
-  # Primary: match our metadata line "# domain=<domain>"
-  mapfile -t matches < <(list_confs_by_meta_domain "$domain")
-
-  # Fallback: match server_name token containing the domain (best-effort, avoids missing metadata)
-  if [[ ${#matches[@]} -eq 0 ]]; then
-    mapfile -t matches < <(awk -v d="$domain" '
-      BEGIN{in_server=0; hasDomain=0}
-      /server[[:space:]]*\{/ {in_server=1; hasDomain=0}
-      in_server && index($0, "server_name") {
-        # Exact token match: server_name a b c;
-        line=$0
-        sub(/.*server_name[[:space:]]+/, "", line)
-        gsub(/;/, "", line)
-        n=split(line, a, /[[:space:]]+/)
-        for (i=1; i<=n; i++) {
-          if (a[i] == d) {hasDomain=1}
-        }
-      }
-      in_server && /}/ {
-        if (hasDomain && !printed[FILENAME]) {
-          print FILENAME
-          printed[FILENAME]=1
-        }
-        in_server=0
-      }
-    ' "${CONF_DIR}"/*.conf 2>/dev/null || true)
-  fi
-  [[ ${#matches[@]} -gt 0 ]] || return 0
-
-  for conf_file in "${matches[@]}"; do
-    if grep -q '/\.well-known/acme-challenge/' "$conf_file"; then
-      continue
-    fi
-
-    tmp_file="$(mktemp /tmp/nginxx-acme-loc-"${domain}"-XXXXXX)"
-    tmp_files+=("$tmp_file")
-    awk '
-      BEGIN{inserted=0}
-      {
-        if (inserted==0 && $0 ~ /^[[:space:]]*location \/ \{/ ) {
-          print "    # ACME HTTP-01 验证路径（证书申请/续期）"
-          print "    location ^~ /.well-known/acme-challenge/ {"
-          print "        root /usr/share/nginx/html;"
-          print "        default_type \"text/plain\";"
-          print "        try_files $uri =404;"
-          print "    }"
-          print ""
-          inserted=1
-        }
-        print $0
-      }
-    ' "$conf_file" > "$tmp_file"
-
-    if ! apply_conf_with_rollback "$tmp_file" "$conf_file"; then
-      error "补充 ACME 验证路径失败，已保留原配置：${conf_file}"
-      return 1
-    fi
-    rm -f "$tmp_file"
-  done
-}
-
-ensure_http_challenge_server() {
-  # 为“非80端口业务配置”补一个临时 80 验证入口，保证 HTTP-01 可达
-  local domain="$1"
-  local challenge_conf="${CONF_DIR}/acme-challenge-${domain}.conf"
-
-  # 检测是否已存在“同域名 + 80监听”的配置
-  if awk -v d="$domain" '
-    BEGIN{in_server=0; has80=0; hasDomain=0}
-    /server[[:space:]]*\{/ {in_server=1; has80=0; hasDomain=0}
-    in_server && /listen[[:space:]]+80([[:space:]]|;)/ {has80=1}
-    in_server && index($0, "server_name") && index($0, d) {hasDomain=1}
-    in_server && /}/ {
-      if (has80 && hasDomain) {print "yes"; exit 0}
-      in_server=0
-    }
-  ' "${CONF_DIR}"/*.conf 2>/dev/null | grep -q yes; then
-    echo ""
-    return 0
-  fi
-
-  local tmp_challenge
-  tmp_challenge="$(mktemp /tmp/.acme-challenge-"${domain}"-XXXXXX)"
-  trap 'rm -f "${tmp_challenge:-}"' RETURN
-
-  cat > "$tmp_challenge" <<EOF
-server {
-    listen 80;
-    server_name ${domain};
-
-    location ^~ /.well-known/acme-challenge/ {
-        root /usr/share/nginx/html;
-        default_type "text/plain";
-        try_files \$uri =404;
-    }
-
-    location / {
-        return 404;
-    }
-}
-EOF
-
-  install_managed_file "$tmp_challenge" "$challenge_conf"
-  rm -f "$tmp_challenge"
-  echo "$challenge_conf"
-}
-
-cleanup_http_challenge_server() {
-  local challenge_conf="$1"
-  [[ -z "$challenge_conf" ]] && return 0
-  ${SUDO} rm -f "$challenge_conf" 2>/dev/null || true
-}
-
-precheck_http01() {
-  # 证书申请前自检：DNS、80监听、challenge本地命中、域名回环可达
-  # 返回码：0=通过，10=软失败(可继续)，11=硬失败(不建议继续)
-  local domain="$1"
-  local token file_path local_url domain_url local_body domain_body
-
-  note "开始执行 HTTP-01 申请前自检..."
-
-  # 1) DNS 解析检查
-  local dns_out
-  dns_out="$(getent ahosts "$domain" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ' || true)"
-  if [[ -z "$dns_out" ]]; then
-    error "自检失败：域名 ${domain} 未解析到任何 IP。"
-    return 11
-  fi
-  info "DNS解析：${dns_out}"
-
-  # 2) 本机80监听检查（ss/netstat//proc 兜底，BusyBox 兼容）
-  if ! nginx_port_listening 80; then
-    error "自检失败：本机未监听 80 端口。"
-    return 11
-  fi
-
-  # 3) challenge 文件本地命中检查
-  token="nginxx-check-$(date +%s)-$RANDOM"
-  file_path="/usr/share/nginx/html/.well-known/acme-challenge/${token}"
-  ${SUDO} mkdir -p "$(dirname "$file_path")"
-  echo "$token" | ${SUDO} tee "$file_path" >/dev/null
-
-  local_url="http://127.0.0.1/.well-known/acme-challenge/${token}"
-  local_body="$(curl -fsS --max-time 8 -H "Host: ${domain}" "$local_url" 2>/dev/null || true)"
-  if [[ "$local_body" != "$token" ]]; then
-    ${SUDO} rm -f "$file_path" 2>/dev/null || true
-    error "自检失败：本机 challenge 路径未命中（${local_url}，Host: ${domain}）。"
-    return 11
-  fi
-
-  # 4) 域名回环可达检查（模拟 CA 通过域名访问 80）
-  domain_url="http://${domain}/.well-known/acme-challenge/${token}"
-  domain_body="$(curl -fsS --max-time 10 "$domain_url" 2>/dev/null || true)"
-  ${SUDO} rm -f "$file_path" 2>/dev/null || true
-
-  if [[ "$domain_body" != "$token" ]]; then
-    warn "自检警告：域名 ${domain} 的 80 回源不可达或返回内容不匹配。"
-    warn "这可能是网络/回环差异导致的误判。"
-    warn "请检查云安全组/防火墙/NAT/CDN 对 80 端口的放行。"
-    return 10
-  fi
-
-  info "HTTP-01 自检通过。"
-  return 0
-}
-
-issue_cert() {
-  local domain cert_mode
-  load_email
-
-  if [[ -z "${ACME_EMAIL:-}" ]]; then
-    error "未设置邮箱。请先在证书管理里执行 [1) 设置邮箱]。"
-    return 1
-  fi
-
-  read -rp "请输入要申请证书的域名: " domain
-  if ! valid_domain "$domain"; then
-    error "域名格式不合法。请输入可签发证书的域名，例如 example.com。"
-    return 1
-  fi
-
-  cert_mode="$(select_cert_mode_interactive)"
-
-  if [[ "$cert_mode" == "dns" ]]; then
-    _issue_cert_dns "$domain"
-  else
-    _issue_cert_http "$domain"
-  fi
-}
-
-issue_cert_for_domain() {
-  local domain="$1"
-  local cert_mode="${2:-}"
-  load_email
-
-  if [[ -z "${ACME_EMAIL:-}" ]]; then
-    error "未设置邮箱，无法自动申请证书。请先在证书管理里设置邮箱。"
-    return 1
-  fi
-
-  if [[ -z "$cert_mode" ]]; then
-    cert_mode="$(detect_cert_mode)"
-  fi
-
-  if [[ "$cert_mode" == "dns" ]]; then
-    if ! has_dns_config; then
-      error "DNS-01 需要配置 DNS API Token，请先设置。"
-      return 1
-    fi
-    info "使用 DNS-01 方式为 ${domain} 申请证书..."
-    _issue_cert_dns "$domain"
-  else
-    _issue_cert_http "$domain"
-  fi
-}
-
-cert_list_action_menu() {
-  local domain="$1"
-  while true; do
-    clear
-    echo "====== 证书操作：${domain} ======"
-    echo "1) 重新申请"
-    echo "2) 启停续期"
-    echo "3) 删除证书"
-    echo "0) 返回上一级"
-    echo "============================="
-    read -rp "请选择: " c
-
-    case "$c" in
-      1)
-        load_email
-        if [[ -z "${ACME_EMAIL:-}" ]]; then
-          if ! ensure_email_interactive; then
-            error "邮箱未设置，无法重新申请。"
-            pause
-            return 0
-          fi
-        fi
-        run_menu_action issue_cert_for_domain "$domain"
-        pause
-        return 0
-        ;;
-      2)
-        if has_acme_cron_task; then
-          if confirm "当前续期任务已开启，是否关闭？"; then
-            disable_acme_cron
-          fi
-        else
-          if confirm "当前续期任务未开启，是否开启？"; then
-            enable_acme_cron
-          fi
-        fi
-        pause
-        return 0
-        ;;
-      3)
-        local -a refs
-        mapfile -t refs < <(cert_referenced_confs "$domain")
-        if [[ ${#refs[@]} -gt 0 ]]; then
-          warn "证书 ${domain} 仍被以下 Nginx 配置引用，已拒绝删除："
-          local ref
-          for ref in "${refs[@]}"; do
-            warn "  - ${ref}"
-          done
-          warn "请先停用对应站点 HTTPS 或手动移除证书引用，再删除证书。"
-          pause
-          return 0
-        fi
-
-        if ! confirm "确认删除证书 ${domain} ?"; then
-          info "已取消。"
-          pause
-          return 0
-        fi
-
-        local ssl_backup="" acme_backup="" acme_ecc_backup=""
-        ssl_backup="$(mktemp -d /tmp/nginxx-cert-"${domain}"-XXXXXX)"
-        if [[ -d "${SSL_DIR}/${domain}" ]]; then
-          ${SUDO} cp -a "${SSL_DIR}/${domain}" "${ssl_backup}/ssl" 2>/dev/null || true
-        fi
-        if [[ -d "$HOME/.acme.sh/${domain}" ]]; then
-          acme_backup="${ssl_backup}/acme"
-          cp -a "$HOME/.acme.sh/${domain}" "$acme_backup" 2>/dev/null || true
-        fi
-        if [[ -d "$HOME/.acme.sh/${domain}_ecc" ]]; then
-          acme_ecc_backup="${ssl_backup}/acme_ecc"
-          cp -a "$HOME/.acme.sh/${domain}_ecc" "$acme_ecc_backup" 2>/dev/null || true
-        fi
-
-        if [[ -x "$HOME/.acme.sh/acme.sh" ]]; then
-          "$HOME/.acme.sh/acme.sh" --remove -d "$domain" >/dev/null 2>&1 || true
-        fi
-        rm -rf "$HOME/.acme.sh/${domain}" "$HOME/.acme.sh/${domain}_ecc" 2>/dev/null || true
-        ${SUDO} rm -rf "${SSL_DIR}/${domain}" 2>/dev/null || true
-
-        if ! nginx_test; then
-          warn "删除证书后 nginx -t 失败，正在恢复证书文件。"
-          if [[ -d "${ssl_backup}/ssl" ]]; then
-            ${SUDO} mkdir -p "$SSL_DIR"
-            ${SUDO} cp -a "${ssl_backup}/ssl" "${SSL_DIR}/${domain}"
-          fi
-          if [[ -n "$acme_backup" && -d "$acme_backup" ]]; then
-            mkdir -p "$HOME/.acme.sh"
-            cp -a "$acme_backup" "$HOME/.acme.sh/${domain}" 2>/dev/null || true
-          fi
-          if [[ -n "$acme_ecc_backup" && -d "$acme_ecc_backup" ]]; then
-            mkdir -p "$HOME/.acme.sh"
-            cp -a "$acme_ecc_backup" "$HOME/.acme.sh/${domain}_ecc" 2>/dev/null || true
-          fi
-          rm -rf "$ssl_backup" 2>/dev/null || true
-          error "证书删除已回滚。请检查 nginx -t 输出后重试。"
-          ${SUDO} nginx -t || true
-          pause
-          return 1
-        fi
-
-        rm -rf "$ssl_backup" 2>/dev/null || true
-        info "证书已删除：${domain}"
-        pause
-        return 0
-        ;;
-      0) return 0 ;;
-      *) warn "无效输入。请输入 0-3 之间的菜单编号。"; pause ;;
-    esac
-  done
-}
-
-cert_list_menu() {
-  if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then
-    warn "未检测到 acme.sh，请先申请证书。"
-    pause
-    return 0
-  fi
-
-  local -a certs
-  local domain idx renew_status
-  mapfile -t certs < <(
-    "$HOME/.acme.sh/acme.sh" --list 2>/dev/null | awk 'NR>1 && NF>0 {print $1}'
-  )
-
-  if [[ ${#certs[@]} -eq 0 ]]; then
-    warn "当前未发现已签发证书。你可以先去 [2) 申请证书]。"
-    return 0
-  fi
-
-  while true; do
-    clear
-    echo "========== 证书列表 =========="
-    if has_acme_cron_task; then
-      renew_status="已开启"
-    else
-      renew_status="未开启"
-    fi
-
-    for i in "${!certs[@]}"; do
-      echo "$((i+1))) ${certs[$i]}  [续期任务: ${renew_status}]"
-    done
-    echo "0) 返回上一级"
-    echo "============================"
-    read -rp "请输入证书编号: " idx
-
-    if [[ "$idx" == "0" ]]; then
-      return 0
-    fi
-    if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > ${#certs[@]} )); then
-      warn "无效编号。请输入证书列表中存在的编号。"
-      pause
-      continue
-    fi
-
-    domain="${certs[$((idx-1))]}"
-    cert_list_action_menu "$domain"
-
-    # 操作后刷新证书列表
-    mapfile -t certs < <(
-      "$HOME/.acme.sh/acme.sh" --list 2>/dev/null | awk 'NR>1 && NF>0 {print $1}'
-    )
-    if [[ ${#certs[@]} -eq 0 ]]; then
-      warn "当前已无证书。"
-      pause
-      return 0
-    fi
-  done
-}
-
-enable_https_for_domain() {
-  enable_https_from_config_list
-}
-
 extract_domain_from_conf() {
   local conf_file="$1"
   local d
@@ -3652,7 +2216,7 @@ extract_domain_from_conf() {
 
 conf_https_enabled() {
   local conf_file="$1"
-  grep -q '^# https_enabled=true' "$conf_file" 2>/dev/null || grep -qE 'listen[[:space:]]+[0-9]+[[:space:]]+ssl' "$conf_file" 2>/dev/null
+  grep -q '^# https_enabled=true' "$conf_file" 2>/dev/null || grep -qE 'listen[[:space:]]+[^;[:space:]]+[[:space:]]+([^;]*[[:space:]])?ssl([[:space:]]|;)'  "$conf_file" 2>/dev/null
 }
 
 health_probe_url() {
@@ -3873,139 +2437,6 @@ site_health_menu() {
   done
 }
 
-disable_https_for_conf_file() {
-  local domain="$1"
-  local conf_file="$2"
-  local mode external_mode upstream_url stream_upstream_url source_site_url referer_url
-  local stream_upstream_urls
-  local listen_port existing_upstream host_header ssl_sni_line stream_mode stream_block tmp
-  local backend_port_meta backend_meta_line
-
-  ensure_websocket_map
-
-  require_template_rebuild_safe "$conf_file" "停用 HTTPS" || return 1
-
-  mode="$(conf_meta_get "$conf_file" mode)"
-  if [[ "$mode" == "external" ]]; then
-    listen_port="$(conf_meta_get "$conf_file" listen_port)"
-    [[ -z "$listen_port" ]] && listen_port="80"
-    external_mode="$(conf_meta_get "$conf_file" external_mode)"
-    upstream_url="$(conf_meta_get "$conf_file" upstream_url)"
-    stream_upstream_url="$(conf_meta_get "$conf_file" stream_upstream_url)"
-    stream_upstream_urls="$(conf_meta_get "$conf_file" stream_upstream_urls)"
-    source_site_url="$(conf_meta_get "$conf_file" source_site_url)"
-    referer_url="$(conf_meta_get "$conf_file" referer_url)"
-    [[ -z "$external_mode" ]] && external_mode="normal"
-
-    tmp="$(mktemp /tmp/nginxx-disable-https-"${domain}"-XXXXXX)"
-    trap 'rm -f "${tmp:-}"' RETURN
-    build_external_proxy_conf "$domain" "$listen_port" "$upstream_url" "$external_mode" "$tmp" "0" "$stream_upstream_url" "$source_site_url" "$referer_url" "$stream_upstream_urls"
-    if apply_conf_with_rollback "$tmp" "$conf_file"; then
-      info "HTTPS 已停用：$(basename "$conf_file")"
-      rm -f "$tmp"
-      return 0
-    fi
-
-    rm -f "$tmp"
-    return 1
-  fi
-
-  listen_port="$(conf_meta_get "$conf_file" listen_port)"
-  [[ -z "$listen_port" ]] && listen_port="80"
-  backend_port_meta="$(conf_meta_get "$conf_file" backend_port)"
-
-  stream_mode="$(conf_meta_get "$conf_file" stream_mode)"
-  stream_block=""
-  if [[ "$stream_mode" == "media" ]]; then
-    stream_block=$(cat <<'BLOCK'
-        # Stream 转发优化（Emby/Jellyfin 等）
-        proxy_request_buffering off;
-        proxy_buffering off;
-        proxy_max_temp_file_size 0;
-        send_timeout 3600s;
-        client_max_body_size 0;
-BLOCK
-)
-  fi
-
-  if [[ -n "$backend_port_meta" ]]; then
-    existing_upstream="http://127.0.0.1:${backend_port_meta}"
-  else
-    existing_upstream="$(extract_proxy_pass "$conf_file")"
-  fi
-  [[ -z "$existing_upstream" ]] && existing_upstream="http://127.0.0.1:3000"
-  [[ -z "$backend_port_meta" ]] && backend_port_meta="$(url_explicit_port "$existing_upstream")"
-  backend_meta_line=""
-  [[ -n "$backend_port_meta" ]] && backend_meta_line="# backend_port=${backend_port_meta}"
-
-  if [[ "$existing_upstream" =~ ^https?://127\.0\.0\.1(:[0-9]+)?(/|$) ]]; then
-    # shellcheck disable=SC2016
-    host_header='$host'
-    ssl_sni_line=''
-  else
-    # shellcheck disable=SC2016
-    host_header='$proxy_host'
-    if [[ "$existing_upstream" =~ ^https:// ]]; then
-      ssl_sni_line='        proxy_ssl_server_name on;'
-    else
-      ssl_sni_line=''
-    fi
-  fi
-
-  tmp="$(mktemp /tmp/nginxx-disable-https-"${domain}"-XXXXXX)"
-  trap 'rm -f "${tmp:-}"' RETURN
-  cat > "$tmp" <<EOF
-# managed_by=Nginx-X
-# domain=${domain}
-# listen_port=${listen_port}
-${backend_meta_line}
-# stream_mode=${stream_mode:-normal}
-
-server {
-    listen ${listen_port};
-    server_name ${domain};
-
-    # ACME HTTP-01 验证路径（证书申请/续期）
-    location ^~ /.well-known/acme-challenge/ {
-        root /usr/share/nginx/html;
-        default_type "text/plain";
-        try_files \$uri =404;
-    }
-
-    location / {
-        proxy_pass ${existing_upstream};
-        proxy_http_version 1.1;
-
-${stream_block}
-
-${ssl_sni_line}
-
-        proxy_set_header Host ${host_header};
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Forwarded-Host \$host;
-        proxy_set_header X-Forwarded-Port \$server_port;
-
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
-
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-    }
-}
-EOF
-
-  if apply_conf_with_rollback "$tmp" "$conf_file"; then
-    info "HTTPS 已停用：$(basename "$conf_file")"
-    rm -f "$tmp"
-    return 0
-  fi
-
-  rm -f "$tmp"
-  return 1
-}
-
 enable_https_from_config_list() {
   local -a confs
   local idx conf_file domain
@@ -4109,203 +2540,8 @@ enable_https_for_domain_value() {
   enable_https_for_conf_file "$domain" "$conf_file"
 }
 
-enable_https_for_conf_file() {
-  local domain="$1"
-  local conf_file="$2"
-  local force_port="${3:-}"
-  local mode external_mode upstream_url stream_upstream_url stream_upstream_urls source_site_url referer_url
-  local tmp listen_port redirect_suffix stream_mode stream_block effective_https_port
-
-  ensure_websocket_map
-
-  if [[ ! -f "$conf_file" ]]; then
-    error "配置文件不存在：${conf_file}"
-    return 1
-  fi
-
-  require_template_rebuild_safe "$conf_file" "启用 HTTPS" || return 1
-
-  if [[ ! -f "${SSL_DIR}/${domain}/fullchain.pem" || ! -f "${SSL_DIR}/${domain}/privkey.pem" ]]; then
-    error "未找到证书文件：${SSL_DIR}/${domain}/"
-    return 1
-  fi
-
-  # 优先读取配置注释中的监听端口，缺失时回退 443
-  listen_port="$(conf_meta_get "$conf_file" listen_port)"
-  [[ -n "$force_port" ]] && listen_port="$force_port"
-  [[ -z "$listen_port" ]] && listen_port="443"
-
-  effective_https_port="$listen_port"
-  if [[ "$effective_https_port" == "80" ]]; then
-    effective_https_port="443"
-  fi
-
-  mode="$(conf_meta_get "$conf_file" mode)"
-  if [[ "$mode" == "external" ]]; then
-    external_mode="$(conf_meta_get "$conf_file" external_mode)"
-    upstream_url="$(conf_meta_get "$conf_file" upstream_url)"
-    stream_upstream_url="$(conf_meta_get "$conf_file" stream_upstream_url)"
-    stream_upstream_urls="$(conf_meta_get "$conf_file" stream_upstream_urls)"
-    source_site_url="$(conf_meta_get "$conf_file" source_site_url)"
-    referer_url="$(conf_meta_get "$conf_file" referer_url)"
-    [[ -z "$external_mode" ]] && external_mode="normal"
-
-    tmp="$(mktemp /tmp/nginxx-https-"${domain}"-XXXXXX)"
-    trap 'rm -f "${tmp:-}"' RETURN
-    build_external_proxy_conf "$domain" "$effective_https_port" "$upstream_url" "$external_mode" "$tmp" "1" "$stream_upstream_url" "$source_site_url" "$referer_url" "$stream_upstream_urls"
-    if apply_conf_with_rollback "$tmp" "$conf_file"; then
-      info "HTTPS 已启用，且已配置 80 -> ${effective_https_port} 强制跳转。"
-      rm -f "$tmp"
-      return 0
-    fi
-
-    rm -f "$tmp"
-    return 1
-  fi
-
-  if [[ "$effective_https_port" == "443" ]]; then
-    redirect_suffix=""
-  else
-    redirect_suffix=":${effective_https_port}"
-  fi
-
-  stream_mode="$(conf_meta_get "$conf_file" stream_mode)"
-  stream_block=""
-  if [[ "$stream_mode" == "media" ]]; then
-    stream_block=$(cat <<'BLOCK'
-        # Stream 转发优化（Emby/Jellyfin 等）
-        proxy_request_buffering off;
-        proxy_buffering off;
-        proxy_max_temp_file_size 0;
-        send_timeout 3600s;
-        client_max_body_size 0;
-BLOCK
-)
-  fi
-
-  tmp="$(mktemp /tmp/nginxx-https-"${domain}"-XXXXXX)"
-  trap 'rm -f "${tmp:-}"' RETURN
-
-  # 复用原配置上游：优先读取注释元数据，避免同端口多域名场景误取到错误上游
-  local existing_upstream host_header ssl_sni_line backend_port_meta upstream_url_meta backend_meta_line
-  upstream_url_meta="$(conf_meta_get "$conf_file" upstream_url)"
-  backend_port_meta="$(conf_meta_get "$conf_file" backend_port)"
-
-  if [[ -n "$upstream_url_meta" ]]; then
-    existing_upstream="$upstream_url_meta"
-  elif [[ -n "$backend_port_meta" ]]; then
-    existing_upstream="http://127.0.0.1:${backend_port_meta}"
-  else
-    existing_upstream="$(grep -Eo 'proxy_pass [^;]+' "$conf_file" | head -n1 | sed 's/^proxy_pass //')"
-  fi
-
-  [[ -z "$existing_upstream" ]] && existing_upstream="http://127.0.0.1:3000"
-  [[ -z "$backend_port_meta" ]] && backend_port_meta="$(url_explicit_port "$existing_upstream")"
-  backend_meta_line=""
-  [[ -n "$backend_port_meta" ]] && backend_meta_line="# backend_port=${backend_port_meta}"
-
-  # 外部上游（尤其 https）需要 SNI 与上游 Host，避免 502/握手失败
-  if [[ "$existing_upstream" =~ ^https?://127\.0\.0\.1(:[0-9]+)?(/|$) ]]; then
-    # shellcheck disable=SC2016
-    host_header='$host'
-    ssl_sni_line=''
-  else
-    # shellcheck disable=SC2016
-    host_header='$proxy_host'
-    if [[ "$existing_upstream" =~ ^https:// ]]; then
-      ssl_sni_line='        proxy_ssl_server_name on;'
-    else
-      ssl_sni_line=''
-    fi
-  fi
-
-  # 生成 HTTPS 配置：若原配置监听 80，则自动切到标准 443，避免 80 同时承担重定向与 SSL 监听
-  local ipv6_listen_80 ipv6_listen_tls
-  ipv6_listen_80="$(nginx_listen_ipv6_line 80 "")"
-  ipv6_listen_tls="$(nginx_listen_ipv6_line "$effective_https_port" "ssl http2")"
-
-  cat > "$tmp" <<EOF
-# managed_by=Nginx-X
-# domain=${domain}
-# https_enabled=true
-# listen_port=${effective_https_port}
-${backend_meta_line}
-# stream_mode=${stream_mode:-normal}
-
-server {
-    listen 80;
-${ipv6_listen_80}
-    server_name ${domain};
-
-    # 保留 ACME 验证路径，避免被 301 跳转影响签发/续期
-    location ^~ /.well-known/acme-challenge/ {
-        root /usr/share/nginx/html;
-        default_type "text/plain";
-        try_files \$uri =404;
-    }
-
-    return 301 https://\$host${redirect_suffix}\$request_uri;
-}
-
-server {
-    listen ${effective_https_port} ssl http2;
-${ipv6_listen_tls}
-    server_name ${domain};
-
-    ssl_certificate     ${SSL_DIR}/${domain}/fullchain.pem;
-    ssl_certificate_key ${SSL_DIR}/${domain}/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers off;
-
-    location / {
-        proxy_pass ${existing_upstream};
-        proxy_http_version 1.1;
-
-${stream_block}
-
-${ssl_sni_line}
-
-        proxy_set_header Host ${host_header};
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Forwarded-Host \$host;
-        proxy_set_header X-Forwarded-Port \$server_port;
-
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
-
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-    }
-}
-EOF
-
-  if apply_conf_with_rollback "$tmp" "$conf_file"; then
-    info "HTTPS 已启用，且已配置 80 -> ${effective_https_port} 强制跳转。"
-    rm -f "$tmp"
-    return 0
-  fi
-
-  rm -f "$tmp"
-  return 1
-}
-
-# ---------- 仅域名访问（隐藏IP） ----------
-DOMAIN_ONLY_IN_SYNC=0
-
 domain_only_conf_path() {
   echo "${CONF_DIR}/00-nx-domain-only.conf"
-}
-
-domain_only_state_is_enabled() {
-  DOMAIN_ONLY=0
-  if [[ ! -f "$DOMAIN_ONLY_STATE" ]]; then
-    return 1
-  fi
-  # shellcheck disable=SC1090
-  . "$DOMAIN_ONLY_STATE"
-  [[ "${DOMAIN_ONLY:-0}" == "1" ]]
 }
 
 nginx_supports_ssl_reject_handshake() {
@@ -4317,246 +2553,6 @@ nginx_supports_ssl_reject_handshake() {
   version_gt "$v" "1.19.3"
 }
 
-# 收集受管配置的监听端口，输出 "plain <port>" 或 "ssl <port>"。
-# 只统计通配 listen（如 listen 80; / listen [::]:443 ssl;），
-# 绑定到具体地址的 listen（如 127.0.0.1:8088）不参与拦截。
-domain_only_collect_ports() {
-  local f line p flags
-  while IFS= read -r f; do
-    [[ -f "$f" ]] || continue
-    # 按指令匹配（兼容单行/多行 server 块），忽略绑定具体地址的 listen
-    while IFS= read -r line; do
-      p="$(printf '%s\n' "$line" | sed -nE 's/^listen[[:space:]]+(\[[^]]*\]:)?([0-9]+)([[:space:]][^;]*)?;$/\2/p')"
-      [[ -n "$p" ]] || continue
-      flags="$(printf '%s\n' "$line" | sed -nE 's/^listen[[:space:]]+(\[[^]]*\]:)?([0-9]+)([[:space:]][^;]*)?;$/\3/p')"
-      if [[ "$flags" == *ssl* ]]; then
-        echo "ssl ${p}"
-      else
-        echo "plain ${p}"
-      fi
-    done < <(grep -hoE 'listen[[:space:]]+[^;]+;' "$f" 2>/dev/null || true)
-  done < <(list_managed_conf_files)
-}
-
-# 找出 catch-all 之外已声明 default_server 的端口
-domain_only_taken_ports() {
-  local f base
-  for f in "${CONF_DIR}"/*.conf; do
-    [[ -f "$f" ]] || continue
-    base="$(basename "$f")"
-    [[ "$base" == "00-nx-domain-only.conf" ]] && continue
-    grep -hoE 'listen[[:space:]]+(\[[^]]*\]:)?[0-9]+[^;]*default_server[^;]*;' "$f" 2>/dev/null \
-      | sed -nE 's/^listen[[:space:]]+(\[[^]]*\]:)?([0-9]+)[^;]*;$/\2/p' || true
-  done | sort -un
-}
-
-domain_only_ensure_placeholder_cert() {
-  local cert_dir="${SSL_DIR}/nx-domain-only"
-  if [[ -f "$cert_dir/fullchain.pem" && -f "$cert_dir/privkey.pem" ]]; then
-    return 0
-  fi
-  if ! check_cmd openssl; then
-    error "未检测到 openssl，无法生成自签占位证书。"
-    return 1
-  fi
-  ${SUDO} mkdir -p "$cert_dir"
-  local tmp_key tmp_crt
-  tmp_key="$(mktemp /tmp/nginxx-tlskey-XXXXXX)"
-  tmp_crt="$(mktemp /tmp/nginxx-tlscrt-XXXXXX)"
-  if ! openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-      -subj '/CN=nx-domain-only' \
-      -keyout "$tmp_key" -out "$tmp_crt" >/dev/null 2>&1; then
-    rm -f "$tmp_key" "$tmp_crt"
-    error "生成自签占位证书失败。"
-    return 1
-  fi
-  install_managed_file "$tmp_crt" "$cert_dir/fullchain.pem"
-  ${SUDO} install -m 0600 "$tmp_key" "$cert_dir/privkey.pem"
-  rm -f "$tmp_key" "$tmp_crt"
-  info "已生成自签占位证书：${cert_dir}/"
-}
-
-domain_only_emit_cert_lines() {
-  echo "    ssl_certificate     ${SSL_DIR}/nx-domain-only/fullchain.pem;"
-  echo "    ssl_certificate_key ${SSL_DIR}/nx-domain-only/privkey.pem;"
-}
-
-# 生成 catch-all 配置（形态已用真实 nginx 验证）：
-#   - 纯 HTTP 端口  → plain default_server 块（return 444）
-#   - 纯 HTTPS 端口 → ssl default_server 块（nginx>=1.19.4 用 ssl_reject_handshake 拒绝握手，否则配占位证书）
-#   - 混合端口（同端口既有 HTTP 又有 HTTPS 站点）→ ssl default_server 块 + 占位证书，
-#     同一 socket 的默认服务一并接管（HTTP 与 TLS 的未匹配请求都会命中本块）
-build_domain_only_conf() {
-  local out="$1"
-
-  local -A has_plain=() has_ssl=()
-  local -a all_ports=()
-  local kind p
-  while read -r kind p; do
-    [[ -z "$kind" || -z "$p" ]] && continue
-    if [[ "$kind" == "ssl" ]]; then
-      has_ssl["$p"]=1
-    else
-      has_plain["$p"]=1
-    fi
-    all_ports+=("$p")
-  done < <(domain_only_collect_ports)
-
-  if (( ${#has_plain[@]} == 0 && ${#has_ssl[@]} == 0 )); then
-    warn "没有检测到可用的 Nginx 监听端口，请先在 [配置管理] 创建站点配置。"
-    return 1
-  fi
-
-  local -A taken=() classified=()
-  local tp
-  while IFS= read -r tp; do
-    if [[ -n "$tp" ]]; then
-      taken["$tp"]=1
-    fi
-  done < <(domain_only_taken_ports)
-
-  local -a plain_ports=() ssl_ports=() mixed_ports=()
-  for p in "${all_ports[@]}"; do
-    if [[ -n "${classified[$p]:-}" ]]; then
-      continue
-    fi
-    classified["$p"]=1
-    if [[ -n "${taken[$p]:-}" ]]; then
-      warn "端口 ${p} 已存在 default_server 配置，跳过该端口的 IP 拦截。"
-      continue
-    fi
-    if [[ -n "${has_plain[$p]:-}" && -n "${has_ssl[$p]:-}" ]]; then
-      mixed_ports+=("$p")
-    elif [[ -n "${has_ssl[$p]:-}" ]]; then
-      ssl_ports+=("$p")
-    else
-      plain_ports+=("$p")
-    fi
-  done
-
-  if (( ${#plain_ports[@]} == 0 && ${#ssl_ports[@]} == 0 && ${#mixed_ports[@]} == 0 )); then
-    warn "所有监听端口均已有 default_server，未生成仅域名访问配置。"
-    return 1
-  fi
-
-  local reject_supported=0
-  if nginx_supports_ssl_reject_handshake; then
-    reject_supported=1
-  fi
-
-  local need_cert=0
-  if (( ${#mixed_ports[@]} > 0 )); then
-    need_cert=1
-  fi
-  if (( ${#ssl_ports[@]} > 0 && reject_supported == 0 )); then
-    need_cert=1
-  fi
-  if (( need_cert == 1 )); then
-    domain_only_ensure_placeholder_cert || return 1
-  fi
-
-  local -a sorted_plain=() sorted_ssl=() sorted_mixed=()
-  if (( ${#plain_ports[@]} > 0 )); then
-    mapfile -t sorted_plain < <(printf '%s\n' "${plain_ports[@]}" | sort -n)
-  fi
-  if (( ${#ssl_ports[@]} > 0 )); then
-    mapfile -t sorted_ssl < <(printf '%s\n' "${ssl_ports[@]}" | sort -n)
-  fi
-  if (( ${#mixed_ports[@]} > 0 )); then
-    mapfile -t sorted_mixed < <(printf '%s\n' "${mixed_ports[@]}" | sort -n)
-  fi
-
-  {
-    echo "# managed_by=Nginx-X"
-    echo "# domain-only=1"
-    echo ""
-    echo "# 仅域名访问（隐藏IP）：拒绝所有未匹配已配置域名的访问（含 IP 直连）"
-    if (( ${#sorted_plain[@]} > 0 )); then
-      echo "server {"
-      for p in ${sorted_plain[@]+"${sorted_plain[@]}"}; do
-        echo "    listen ${p} default_server;"
-        nginx_listen_ipv6_line "$p" "default_server"
-      done
-      echo "    server_name _;"
-      echo "    access_log off;"
-      echo "    location / {"
-      echo "        return 444;"
-      echo "    }"
-      echo "}"
-    fi
-    if (( ${#sorted_ssl[@]} > 0 )); then
-      echo "server {"
-      for p in ${sorted_ssl[@]+"${sorted_ssl[@]}"}; do
-        echo "    listen ${p} ssl default_server;"
-        nginx_listen_ipv6_line "$p" "ssl default_server"
-      done
-      echo "    server_name _;"
-      echo "    access_log off;"
-      if (( reject_supported == 1 )); then
-        echo "    ssl_reject_handshake on;"
-      else
-        domain_only_emit_cert_lines
-      fi
-      echo "    location / {"
-      echo "        return 444;"
-      echo "    }"
-      echo "}"
-    fi
-    if (( ${#sorted_mixed[@]} > 0 )); then
-      echo "server {"
-      for p in ${sorted_mixed[@]+"${sorted_mixed[@]}"}; do
-        echo "    listen ${p} ssl default_server;"
-        nginx_listen_ipv6_line "$p" "ssl default_server"
-      done
-      echo "    server_name _;"
-      echo "    access_log off;"
-      domain_only_emit_cert_lines
-      echo "    location / {"
-      echo "        return 444;"
-      echo "    }"
-      echo "}"
-    fi
-  } > "$out"
-}
-
-domain_only_sync() {
-  require_nginx_installed || return 1
-
-  local target tmp prev rc=0
-  target="$(domain_only_conf_path)"
-
-  tmp="$(mktemp /tmp/nginxx-domain-only-XXXXXX)"
-  if ! build_domain_only_conf "$tmp"; then
-    rm -f "$tmp"
-    return 1
-  fi
-
-  prev="$DOMAIN_ONLY_IN_SYNC"
-  DOMAIN_ONLY_IN_SYNC=1
-  if ! apply_conf_with_rollback "$tmp" "$target"; then
-    rc=1
-  fi
-  DOMAIN_ONLY_IN_SYNC="$prev"
-  rm -f "$tmp"
-  return $rc
-}
-
-domain_only_rebuild_if_enabled() {
-  if ! domain_only_state_is_enabled; then
-    return 0
-  fi
-  domain_only_sync || true
-}
-
-domain_only_after_apply() {
-  if (( DOMAIN_ONLY_IN_SYNC == 1 )); then
-    return 0
-  fi
-  domain_only_rebuild_if_enabled || true
-}
-
-# 列出本机对外（非回环）监听、但不属于 Nginx 的端口
-# 用途：仅域名访问功能只拦截 Nginx 自身监听的端口，Docker 直接发布的端口等不受此功能控制；开启时逐一提示，避免误解为“全机隐藏IP”
 domain_only_list_exposed_ports() {
   local p line addr hex src
   local -a nginx_ports=()
@@ -4649,98 +2645,6 @@ domain_only_warn_exposed_ports() {
     fi
   done
   warn "如需隐藏这些端口，请在对应服务（如 Docker）中改为仅监听 127.0.0.1，或用防火墙限制来源。"
-}
-
-domain_only_enable() {
-  require_nginx_installed || return 1
-
-  local target
-  target="$(domain_only_conf_path)"
-
-  if [[ -f "$target" ]] && domain_only_state_is_enabled; then
-    warn "仅域名访问已是开启状态。"
-    return 0
-  fi
-
-  if ! domain_only_sync; then
-    error "开启失败：catch-all 配置未通过校验，已自动回滚。"
-    return 1
-  fi
-
-  ensure_state_dir
-  printf 'DOMAIN_ONLY=1\n' > "$DOMAIN_ONLY_STATE"
-  chmod 600 "$DOMAIN_ONLY_STATE" 2>/dev/null || true
-  info "仅域名访问已开启：Nginx 监听的端口仅接受已配置域名的访问，IP 直连会被直接断开。"
-  warn "SSH 与 Nginx 之外的服务不受影响；站点配置变更时会自动同步拦截端口。"
-  domain_only_warn_exposed_ports
-}
-
-domain_only_disable() {
-  require_nginx_installed || return 1
-
-  local target backup prev rc=0
-  target="$(domain_only_conf_path)"
-
-  if [[ ! -f "$target" ]]; then
-    warn "仅域名访问已是关闭状态。"
-    ensure_state_dir
-    printf 'DOMAIN_ONLY=0\n' > "$DOMAIN_ONLY_STATE" 2>/dev/null || true
-    return 0
-  fi
-
-  ensure_state_dir
-  backup="$(mktemp /tmp/nginxx-domain-only-bak-XXXXXX)"
-  ${SUDO} cp -a "$target" "$backup"
-
-  prev="$DOMAIN_ONLY_IN_SYNC"
-  DOMAIN_ONLY_IN_SYNC=1
-  ${SUDO} rm -f "$target"
-  if nginx_test && reload_nginx_safe; then
-    rm -f "$backup"
-    printf 'DOMAIN_ONLY=0\n' > "$DOMAIN_ONLY_STATE"
-    chmod 600 "$DOMAIN_ONLY_STATE" 2>/dev/null || true
-    info "仅域名访问已关闭。"
-  else
-    ${SUDO} cp -a "$backup" "$target"
-    rm -f "$backup"
-    error "关闭失败：Nginx 校验未通过，已恢复 catch-all 配置。"
-    ${SUDO} nginx -t || true
-    rc=1
-  fi
-  DOMAIN_ONLY_IN_SYNC="$prev"
-  return $rc
-}
-
-domain_only_menu() {
-  while true; do
-    local enabled=0
-    if domain_only_state_is_enabled; then
-      enabled=1
-    fi
-
-    clear
-    echo "========== 仅域名访问（隐藏IP） =========="
-    if (( enabled == 1 )); then
-      echo "当前状态：已开启（IP 直连访问会被拒绝）"
-    else
-      echo "当前状态：已关闭"
-    fi
-    echo "1) 开启"
-    echo "2) 关闭"
-    echo "0) 返回上一级"
-    echo "========================================="
-    echo "说明：开启后用 IP / 未配置域名访问 Nginx 端口会被直接断开（不返回任何内容），"
-    echo "只能通过已配置的域名访问站点；SSH 与 Nginx 之外的服务不受影响。"
-    echo "注意：Docker 等直接对外发布的端口不经过 Nginx，本功能无法拦截（开启时会列出）。"
-    read -rp "请选择: " c
-
-    case "$c" in
-      1) run_menu_action domain_only_enable; pause ;;
-      2) run_menu_action domain_only_disable; pause ;;
-      0) return 0 ;;
-      *) warn "无效输入。请输入 0-2 之间的菜单编号。"; pause ;;
-    esac
-  done
 }
 
 cert_menu() {
@@ -5065,9 +2969,12 @@ uninstall_script_only() {
   fi
 
   # 1) 清理快捷启动命令
-  if [[ -f /usr/local/bin/nx ]]; then
-    ${SUDO} rm -f /usr/local/bin/nx
-    info "已移除：/usr/local/bin/nx"
+  local installed_bin
+  installed_bin="$(command -v nx 2>/dev/null || true)"
+  [[ -n "$installed_bin" ]] || installed_bin="/usr/local/bin/nx"
+  if [[ -f "$installed_bin" ]]; then
+    ${SUDO} rm -f "$installed_bin"
+    info "已移除：${installed_bin}"
   else
     warn "未发现 /usr/local/bin/nx，跳过。"
   fi
@@ -5293,7 +3200,7 @@ update_script() {
     bin_md5_before="$(md5sum "$target_bin" 2>/dev/null | awk '{print $1}')"
   fi
 
-  ${SUDO} install -m 0755 "${work_dir}/nx.sh" "$target_bin"
+  ${SUDO} env TARGET_BIN="$target_bin" bash "${work_dir}/install.sh" --no-run || return 1
 
   local bin_md5_after=""
   if check_cmd md5sum; then
@@ -5348,6 +3255,18 @@ main() {
     esac
   done
 }
+
+# All modules load before an update can change the repository on disk.
+NX_LIB_DIR="${NX_LIB_DIR:-${SCRIPT_DIR}/lib}"
+for nx_module in templates certificates transactions access https; do
+  if [[ ! -r "${NX_LIB_DIR}/${nx_module}.sh" ]]; then
+    error "缺少模块：${NX_LIB_DIR}/${nx_module}.sh，请重新运行 install.sh。"
+    if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then exit 1; else return 1; fi
+  fi
+  # shellcheck disable=SC1090
+  source "${NX_LIB_DIR}/${nx_module}.sh"
+done
+unset nx_module
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   main

@@ -34,6 +34,11 @@ error_log stderr;
 events {}
 http {
     access_log off;
+    client_body_temp_path ${TMPDIR_ROOT}/body;
+    proxy_temp_path ${TMPDIR_ROOT}/proxy;
+    fastcgi_temp_path ${TMPDIR_ROOT}/fastcgi;
+    uwsgi_temp_path ${TMPDIR_ROOT}/uwsgi;
+    scgi_temp_path ${TMPDIR_ROOT}/scgi;
     map \$http_upgrade \$connection_upgrade {
         default upgrade;
         '' close;
