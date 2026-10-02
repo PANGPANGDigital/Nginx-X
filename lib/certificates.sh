@@ -6,6 +6,12 @@ load_dns_conf() {
     # shellcheck disable=SC1090
     . "$DNS_CONF"
   fi
+  case "${DNS_PROVIDER:-}" in
+    cloudflare) DNS_PROVIDER=cf ;; dnspod) DNS_PROVIDER=dp ;;
+    alidns) DNS_PROVIDER=ali ;; he.net) DNS_PROVIDER=he ;;
+    godaddy) DNS_PROVIDER=gd ;; huaweicloud) DNS_PROVIDER=hw ;;
+    route53) DNS_PROVIDER=aws ;; gcp) DNS_PROVIDER=google ;;
+  esac
 }
 
 save_dns_conf() {
@@ -180,6 +186,7 @@ select_cert_mode_interactive() {
 
 _issue_cert_dns() {
   local domain="$1"
+  valid_domain "$domain" || return 1
   local dns_args issue_output retry_after
 
   load_email
@@ -222,18 +229,15 @@ _issue_cert_dns() {
     return 1
   }
 
-  ${SUDO} mkdir -p "${SSL_DIR}/${domain}"
-  "$HOME/.acme.sh/acme.sh" --install-cert -d "$domain" \
-    --key-file "${SSL_DIR}/${domain}/privkey.pem" \
-    --fullchain-file "${SSL_DIR}/${domain}/fullchain.pem"
-
-  ensure_acme_cron
+  nx_deploy_certificate "$domain" || return 1
+  ensure_acme_cron || return 1
   info "证书申请并安装成功（DNS-01）。"
 }
 
 _issue_cert_http() {
   # 原有的 HTTP-01 逻辑
   local domain="$1"
+  valid_domain "$domain" || return 1
   local challenge_conf
 
   ensure_acme_location_for_domain_conf "$domain" || return 1
@@ -306,15 +310,9 @@ _issue_cert_http() {
     return 1
   }
 
-  cleanup_http_challenge_server "$challenge_conf" || return 1
-  reload_nginx_safe || return 1
-
-  ${SUDO} mkdir -p "${SSL_DIR}/${domain}"
-  "$HOME/.acme.sh/acme.sh" --install-cert -d "$domain" \
-    --key-file "${SSL_DIR}/${domain}/privkey.pem" \
-    --fullchain-file "${SSL_DIR}/${domain}/fullchain.pem"
-
-  ensure_acme_cron
+  # Keep the challenge endpoint: acme.sh persists this webroot for renewals.
+  nx_deploy_certificate "$domain" || return 1
+  ensure_acme_cron || return 1
   info "证书申请并安装成功。"
 }
 
@@ -367,66 +365,95 @@ ensure_acme_installed() {
   info "acme.sh 安装成功。"
 }
 
-ensure_acme_cron() {
-  local cron_line
-  cron_line="0 3 1 */2 * $HOME/.acme.sh/acme.sh --cron --home $HOME/.acme.sh >/dev/null"
-
-  if crontab -l 2>/dev/null | grep -q 'acme.sh --cron'; then
-    info "已检测到 acme.sh 自动续期任务（crontab）。"
-    return 0
-  fi
-
-  # Alpine dcron: try periodic script as fallback
-  if check_cmd dcron || [[ -d /etc/periodic ]]; then
-    local periodic_script="/etc/periodic/monthly/acme-renew"
-    if [[ -f "$periodic_script" ]]; then
-      info "已检测到 acme.sh 自动续期任务（dcron periodic）。"
-      return 0
-    fi
-    warn "未检测到 acme.sh 自动续期任务。"
-    if confirm "是否一键添加自动续期任务（每月执行）？"; then
-      ${SUDO} mkdir -p /etc/periodic/monthly
-      ${SUDO} tee "$periodic_script" >/dev/null <<EOF
+# Standalone persisted hook: works after the interactive shell exits and in bundles.
+nx_install_acme_reload_hook() {
+  local hook="$HOME/.acme.sh/nginxx-reload" tmp
+  tmp="$(mktemp)" || return 1
+  cat > "$tmp" <<'HOOK'
 #!/bin/sh
-$HOME/.acme.sh/acme.sh --cron --home $HOME/.acme.sh >/dev/null
-EOF
-      ${SUDO} chmod +x "$periodic_script"
-      info "已添加 acme.sh 自动续期任务（/etc/periodic/monthly/acme-renew）。"
-    else
-      warn "你选择了不添加自动续期任务，后续需手动续期。"
-    fi
-    return 0
-  fi
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+if [ "$(id -u)" != 0 ]; then
+    exec sudo -n "$0"
+fi
+nginx -t || exit $?
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    exec systemctl reload nginx
+elif command -v rc-service >/dev/null 2>&1; then
+    exec rc-service nginx reload
+elif [ -x /etc/init.d/nginx ]; then
+    exec /etc/init.d/nginx reload
+else
+    exec nginx -s reload
+fi
+HOOK
+  install -m 0700 "$tmp" "$hook" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+  printf '%s\n' "$hook"
+}
 
-  # Standard crontab
-  warn "未检测到 acme.sh 自动续期任务。"
-  if confirm "是否一键添加自动续期任务（约每60天执行）？"; then
-    (crontab -l 2>/dev/null; echo "$cron_line") | crontab -
-    info "已开启自动续期任务。"
+nx_deploy_certificate() {
+  local domain="$1" hook reloadcmd
+  ${SUDO} mkdir -p "${SSL_DIR}/${domain}" || return 1
+  hook="$(nx_install_acme_reload_hook)" || return 1
+  # POSIX shell quoting, because acme.sh persists and evaluates reloadcmd.
+  reloadcmd="'${hook//\'/\'\\\'\'}'"
+  "$HOME/.acme.sh/acme.sh" --install-cert -d "$domain" \
+    --key-file "${SSL_DIR}/${domain}/privkey.pem" \
+    --fullchain-file "${SSL_DIR}/${domain}/fullchain.pem" \
+    --reloadcmd "$reloadcmd" || { error "证书部署或重载钩子失败。"; return 1; }
+  [[ -s "${SSL_DIR}/${domain}/privkey.pem" && -s "${SSL_DIR}/${domain}/fullchain.pem" ]] || {
+    error "证书部署未生成完整文件。"; return 1;
+  }
+}
+
+ensure_acme_cron() {
+  local current updated periodic="${NX_PERIODIC_DIR:-/etc/periodic}" script
+  current="$(crontab -l 2>/dev/null || true)"
+  # Rewrite only renewal commands belonging to this acme home. Keep their
+  # arguments, environment and all unrelated cron jobs byte-for-byte.
+  updated="$(printf '%s\n' "$current" | awk -v home="$HOME/.acme.sh" '
+    /^[[:space:]]*#/ {print; next}
+    index($0,home "/acme.sh") && /--cron([[:space:]]|$)/ {
+      if ($1 !~ /^@/ && NF >= 6) {sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+/, "0 3 * * *"); found=1}
+      else if ($1 ~ /^@(monthly|yearly|annually|weekly|daily|hourly)$/) {sub(/@[^[:space:]]+/, "0 3 * * *"); found=1}
+    }
+    {print}
+    END {if (!found) print "0 3 * * * \"" home "/acme.sh\" --cron --home \"" home "\" >/dev/null"}
+  ')" || return 1
+  if command -v crontab >/dev/null 2>&1; then
+    printf '%s\n' "$updated" | crontab - || return 1
+  elif [[ -d "$periodic" ]]; then
+    script="$periodic/daily/acme-renew"
+    ${SUDO} mkdir -p "$periodic/daily" || return 1
+    printf '#!/bin/sh\n"%s/.acme.sh/acme.sh" --cron --home "%s/.acme.sh" >/dev/null\n' "$HOME" "$HOME" | ${SUDO} tee "$script" >/dev/null || return 1
+    ${SUDO} chmod 0755 "$script" || return 1
   else
-    warn "你选择了不添加自动续期任务，后续需手动续期。"
+    error "没有可用的每日续期调度器。"; return 1
   fi
+  # Remove only the legacy script generated for this same account.
+  script="$periodic/monthly/acme-renew"
+  if [[ -f "$script" ]] && grep -Fq "$HOME/.acme.sh/acme.sh --cron --home $HOME/.acme.sh" "$script"; then
+    ${SUDO} rm -f "$script" || return 1
+  fi
+  info "已配置每日 ACME 续期检查。"
 }
 
 has_acme_cron_task() {
-  crontab -l 2>/dev/null | grep -q 'acme.sh --cron' || \
-    [[ -f /etc/periodic/monthly/acme-renew ]]
+  crontab -l 2>/dev/null | grep -q 'acme.sh.*--cron' || \
+    [[ -f "${NX_PERIODIC_DIR:-/etc/periodic}/daily/acme-renew" || -f "${NX_PERIODIC_DIR:-/etc/periodic}/monthly/acme-renew" ]]
 }
 
 disable_acme_cron() {
-  if crontab -l 2>/dev/null | grep -q 'acme.sh --cron'; then
-    crontab -l 2>/dev/null | grep -v 'acme.sh --cron' | crontab - || true
-    info "已关闭 crontab 自动续期任务。"
-  fi
-  if [[ -f /etc/periodic/monthly/acme-renew ]]; then
-    ${SUDO} rm -f /etc/periodic/monthly/acme-renew
-    info "已关闭 dcron periodic 自动续期任务。"
-  fi
-  if ! has_acme_cron_task; then
-    :
-  else
-    warn "清理后仍检测到自动续期任务，请手动检查 crontab 和 periodic 目录。"
-  fi
+  local current
+  current="$(crontab -l 2>/dev/null || true)"
+  printf '%s\n' "$current" | awk -v home="$HOME/.acme.sh/acme.sh" '!(index($0,home) && /--cron/ && $0 !~ /^[[:space:]]*#/)' | crontab - || return 1
+  local script
+  for script in "${NX_PERIODIC_DIR:-/etc/periodic}"/{daily,monthly}/acme-renew; do
+    if [[ -f "$script" ]] && grep -Fq "$HOME/.acme.sh/acme.sh" "$script"; then
+      ${SUDO} rm -f "$script" || return 1
+    fi
+  done
 }
 
 enable_acme_cron() {
@@ -463,96 +490,40 @@ ensure_email_interactive() {
 }
 
 ensure_acme_location_for_domain_conf() {
-  # 为已存在的反代配置补齐 ACME 验证 location，避免申请证书时被反代到后端
-  local domain="$1"
-  local -a matches
-  local conf_file tmp_file
-
-  # Collect tmp files so early-return / errors won't leak /tmp files
-  local -a tmp_files=()
-  # shellcheck disable=SC2154
-  trap 'for f in "${tmp_files[@]}"; do rm -f "$f" 2>/dev/null || true; done' RETURN
-
-  # Primary: match our metadata line "# domain=<domain>"
-  mapfile -t matches < <(list_confs_by_meta_domain "$domain")
-
-  # Fallback: match server_name token containing the domain (best-effort, avoids missing metadata)
-  if [[ ${#matches[@]} -eq 0 ]]; then
-    mapfile -t matches < <(awk -v d="$domain" '
-      BEGIN{in_server=0; hasDomain=0}
-      /server[[:space:]]*\{/ {in_server=1; hasDomain=0}
-      in_server && index($0, "server_name") {
-        # Exact token match: server_name a b c;
-        line=$0
-        sub(/.*server_name[[:space:]]+/, "", line)
-        gsub(/;/, "", line)
-        n=split(line, a, /[[:space:]]+/)
-        for (i=1; i<=n; i++) {
-          if (a[i] == d) {hasDomain=1}
-        }
-      }
-      in_server && /}/ {
-        if (hasDomain && !printed[FILENAME]) {
-          print FILENAME
-          printed[FILENAME]=1
-        }
-        in_server=0
-      }
-    ' "${CONF_DIR}"/*.conf 2>/dev/null || true)
-  fi
-  [[ ${#matches[@]} -gt 0 ]] || return 0
-
-  for conf_file in "${matches[@]}"; do
-    if grep -q '/\.well-known/acme-challenge/' "$conf_file"; then
-      continue
+  local domain="$1" conf_file tmp_file match
+  for conf_file in "$CONF_DIR"/*.conf; do
+    [[ -f "$conf_file" ]] || continue
+    # First filter exact names, avoiding parsing unrelated custom configurations.
+    grep -Eq "(^|[[:space:]])${domain//./\\.}([[:space:];]|$)" "$conf_file" || continue
+    match="$(nx_https_transform challenge-probe "$conf_file" "$domain" "$SSL_DIR" "")" || return 1
+    [[ "$match" == yes ]] || continue
+    tmp_file="$(mktemp)" || return 1
+    if ! nx_https_transform challenge "$conf_file" "$domain" "$SSL_DIR" "" > "$tmp_file"; then
+      rm -f "$tmp_file"; return 1
     fi
-
-    tmp_file="$(mktemp /tmp/nginxx-acme-loc-"${domain}"-XXXXXX)"
-    tmp_files+=("$tmp_file")
-    awk '
-      BEGIN{inserted=0}
-      {
-        if (inserted==0 && $0 ~ /^[[:space:]]*location \/ \{/ ) {
-          print "    # ACME HTTP-01 验证路径（证书申请/续期）"
-          print "    location ^~ /.well-known/acme-challenge/ {"
-          print "        root /usr/share/nginx/html;"
-          print "        default_type \"text/plain\";"
-          print "        try_files $uri =404;"
-          print "    }"
-          print ""
-          inserted=1
-        }
-        print $0
-      }
-    ' "$conf_file" > "$tmp_file"
-
-    if ! apply_conf_with_rollback "$tmp_file" "$conf_file"; then
-      error "补充 ACME 验证路径失败，已保留原配置：${conf_file}"
-      return 1
+    if ! cmp -s "$tmp_file" "$conf_file"; then
+      apply_conf_with_rollback "$tmp_file" "$conf_file" || { rm -f "$tmp_file"; return 1; }
     fi
     rm -f "$tmp_file"
   done
 }
 
 ensure_http_challenge_server() {
-  # 为“非80端口业务配置”补一个临时 80 验证入口，保证 HTTP-01 可达
+  # Persistent HTTP-01 endpoint for issuance and every later webroot renewal.
   local domain="$1"
   local challenge_conf="${CONF_DIR}/acme-challenge-${domain}.conf"
 
-  # 检测是否已存在“同域名 + 80监听”的配置
-  if awk -v d="$domain" '
-    BEGIN{in_server=0; has80=0; hasDomain=0}
-    /server[[:space:]]*\{/ {in_server=1; has80=0; hasDomain=0}
-    in_server && /listen[[:space:]]+80([[:space:]]|;)/ {has80=1}
-    in_server && index($0, "server_name") && index($0, d) {hasDomain=1}
-    in_server && /}/ {
-      if (has80 && hasDomain) {print "yes"; exit 0}
-      in_server=0
-    }
-  ' "${CONF_DIR}"/*.conf 2>/dev/null | grep -q yes; then
-    echo ""
-    return 0
-  fi
+  # Exact server_name tokens and structured address-aware listen parsing.
+  local existing match
+  for existing in "$CONF_DIR"/*.conf; do
+    [[ -f "$existing" ]] || continue
+    grep -Eq "(^|[[:space:]])${domain//./\\.}([[:space:];]|$)" "$existing" || continue
+    match="$(nx_https_transform challenge-probe "$existing" "$domain" "$SSL_DIR" "")" || return 1
+    if [[ "$match" == yes ]]; then
+      echo ""
+      return 0
+    fi
+  done
 
   local tmp_challenge
   tmp_challenge="$(mktemp /tmp/.acme-challenge-"${domain}"-XXXXXX)"

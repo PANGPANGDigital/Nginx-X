@@ -61,7 +61,6 @@ build_external_proxy_conf() {
   local source_site_url="${8:-}"
   local referer_url="${9:-}"
 
-  ensure_websocket_map
   local stream_upstream_urls="${10:-}"
   local main_stream_block=""
   local stream_location_block=""
@@ -78,11 +77,9 @@ build_external_proxy_conf() {
 
   upstream_host="$(url_host "$upstream_url")"
 
-  # 非标端口（非 443）时，重写回本机的目标 URL 必须带上端口后缀，
-  # 否则 sub_filter / proxy_redirect 会把推流地址改写成 https://domain（默认 443），
-  # 客户端在 8443 之类端口访问时拿到不可达地址，导致播放流量绕过反代直连源站。
-  local domain_port_suffix=""
-  if [[ "$listen_port" != "443" && "$listen_port" != "80" ]]; then
+  local frontend_scheme="http" domain_port_suffix=""
+  [[ "$https_enabled" == "1" ]] && frontend_scheme="https"
+  if [[ "$frontend_scheme:$listen_port" != "http:80" && "$frontend_scheme:$listen_port" != "https:443" ]]; then
     domain_port_suffix=":${listen_port}"
   fi
 
@@ -100,6 +97,16 @@ build_external_proxy_conf() {
 
   [[ -z "$source_site_url" ]] && source_site_url="$upstream_url"
   [[ -z "$referer_url" && -n "$source_site_url" ]] && referer_url="$(default_referer_from_url "$source_site_url")"
+
+  # Validate every interpolated URL at the builder boundary, including Referer.
+  local candidate
+  for candidate in "$upstream_url" "$source_site_url" "$referer_url" "${stream_urls[@]}"; do
+    if ! nx_template_valid_url "$candidate"; then
+      error "无效或不安全的代理 URL / Referer。" >&2
+      return 1
+    fi
+  done
+  ensure_websocket_map || return 1
 
   https_meta=""
   https_cert_block=""
@@ -135,10 +142,10 @@ BLOCK
         stream_url="${stream_urls[$idx]}"
         stream_path="/s$((idx + 1))/"
         stream_host_line="$(url_host "$stream_url")"
-        stream_redirect_block+="        proxy_redirect ${stream_url} https://${domain}${domain_port_suffix}${stream_path};"$'\n'
+        stream_redirect_block+="        proxy_redirect ${stream_url} ${frontend_scheme}://${domain}${domain_port_suffix}${stream_path};"$'\n'
 
         if [[ "$external_mode" == "emby_lily" ]]; then
-          stream_lily_block+="        sub_filter '${stream_url}' 'https://${domain}${domain_port_suffix}${stream_path%/}';"$'\n'
+          stream_lily_block+="        sub_filter '${stream_url}' '${frontend_scheme}://${domain}${domain_port_suffix}${stream_path%/}';"$'\n'
         fi
 
         stream_sni_block=""
@@ -184,12 +191,12 @@ EOF
       redirect_block="${stream_redirect_block%$'\n'}"
       if [[ "$external_mode" == "emby_lily" ]]; then
         redirect_block+=$'\n'
-        redirect_block+="        proxy_redirect ${source_site_url} https://${domain}${domain_port_suffix};"
+        redirect_block+="        proxy_redirect ${source_site_url} ${frontend_scheme}://${domain}${domain_port_suffix};"
         base_lily_block=$(cat <<EOF
         proxy_set_header Accept-Encoding "";
         sub_filter_types application/json text/xml text/plain;
         sub_filter_once off;
-        sub_filter '${source_site_url}' 'https://${domain}${domain_port_suffix}';
+        sub_filter '${source_site_url}' '${frontend_scheme}://${domain}${domain_port_suffix}';
 EOF
 )
         lily_block="${base_lily_block}"$'\n'"${stream_lily_block}"
@@ -265,6 +272,7 @@ ${https_meta}
 # stream_upstream_urls=${stream_upstream_urls}
 # source_site_url=${source_site_url}
 # referer_url=${referer_url}
+# nx_frontend_rewrites=true
 
 server {
     listen 80;
@@ -277,7 +285,7 @@ ${ipv6_listen_80}
         try_files \$uri =404;
     }
 
-    return 301 https://\$host${redirect_suffix}\$request_uri;
+    location / { return 301 https://\$host${redirect_suffix}\$request_uri; }
 }
 
 server {
@@ -318,6 +326,7 @@ EOF
 # stream_upstream_urls=${stream_upstream_urls}
 # source_site_url=${source_site_url}
 # referer_url=${referer_url}
+# nx_frontend_rewrites=true
 
 server {
     listen ${listen_port};
@@ -347,5 +356,20 @@ ${stream_location_block}
 }
 EOF
   fi
+  if [[ "$https_enabled" == "1" && -f "${CONF_DIR}/acme-challenge-${domain}.conf" ]]; then
+    # The persistent certificate-only endpoint already owns this domain on :80.
+    # Generated templates have exactly a redirect followed by an application.
+    local without_redirect
+    without_redirect="$(mktemp)" || return 1
+    awk 'BEGIN {servers=0} /^server \{/ {servers++} servers != 1 {print}' "$out" > "$without_redirect" || { rm -f "$without_redirect"; return 1; }
+    cat "$without_redirect" > "$out" || { rm -f "$without_redirect"; return 1; }
+    rm -f "$without_redirect"
+  fi
 }
 
+# URLs are emitted into both quoted and unquoted Nginx arguments.
+nx_template_valid_url() {
+  local value="$1"
+  valid_url "$value" && [[ "$value" != *'"'* && "$value" != *'#'* ]] || return 1
+  [[ "$value" =~ ^https?://[^/?#:]+(:[0-9]+)?([/?].*)?$ || "$value" =~ ^https?://\[[0-9a-fA-F:]+\](:[0-9]+)?([/?].*)?$ ]]
+}

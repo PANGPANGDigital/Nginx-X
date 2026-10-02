@@ -23,7 +23,7 @@ nginx_test_command=("$NGINX_TEST_BIN")
 if [[ ${EUID:-0} -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
   nginx_test_command=(sudo "$NGINX_TEST_BIN")
 fi
-openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=example.com \
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=example.com -addext subjectAltName=DNS:example.com,DNS:alias.example.com \
   -keyout "$SSL_DIR/example.com/privkey.pem" -out "$SSL_DIR/example.com/fullchain.pem" >/dev/null 2>&1
 # Exercise the transformation through its public API, with real syntax validation.
 # The shared transaction helper's rollback mechanics have their own regression suite.
@@ -263,3 +263,13 @@ nx_access_set_default "$conf" '0.0.0.0:80,0.0.0.0:18443'
 disable_https_for_conf_file example.com "$conf"
 grep -q '^# access_default=0.0.0.0:80$' "$conf"
 echo 'ok: strict policy, explicit default, and HTTPS round trip'
+
+# Unsupported alias coverage must refuse before any apply, preserving aliases.
+cp "$conf" "$TEST_ROOT/uncovered.conf"
+sed -i 's/server_name example.com alias.example.com;/server_name example.com uncovered.example.com;/' "$TEST_ROOT/uncovered.conf"
+before_count="$apply_count"
+if nx_https_transform enable "$TEST_ROOT/uncovered.conf" example.com "$SSL_DIR" 8443 > "$TEST_ROOT/refused" 2> "$TEST_ROOT/refusal"; then
+  echo 'uncovered alias accepted' >&2; exit 1
+fi
+grep -q 'does not cover server_name uncovered.example.com' "$TEST_ROOT/refusal"
+[[ "$apply_count" == "$before_count" ]]

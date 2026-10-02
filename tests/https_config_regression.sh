@@ -41,8 +41,8 @@ SUDO=""
 CONF_DIR="$TMPDIR_ROOT/conf.d"
 SSL_DIR="$TMPDIR_ROOT/ssl"
 mkdir -p "$CONF_DIR" "$SSL_DIR/example.com"
-: > "$SSL_DIR/example.com/fullchain.pem"
-: > "$SSL_DIR/example.com/privkey.pem"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=example.com \
+  -keyout "$SSL_DIR/example.com/privkey.pem" -out "$SSL_DIR/example.com/fullchain.pem" >/dev/null 2>&1
 
 out="$TMPDIR_ROOT/example-443.conf"
 build_external_proxy_conf \

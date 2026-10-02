@@ -5,9 +5,11 @@
 
 nx_https_transform() {
   command -v python3 >/dev/null 2>&1 || { error "保留配置的 HTTPS 操作需要 python3。" >&2; return 1; }
-  python3 - "$@" <<'PY'
+  NX_HTTPS_CONF_DIR="${CONF_DIR:-}" python3 - "$@" <<'PY'
 import re
 import sys
+import subprocess
+import os
 
 operation, filename, domain, ssl_dir, requested = sys.argv[1:]
 
@@ -161,6 +163,37 @@ try:
                 return False
         return all(listener(n)[1] == '80' and 'ssl' not in listener(n)[2] for n in directives(node, 'listen'))
 
+    if operation in ('challenge', 'challenge-probe'):
+        selected = []
+        for server in servers:
+            if domain not in names(server):
+                continue
+            plain80 = [n for n in directives(server, 'listen') if listener(n)[1] == '80' and 'ssl' not in listener(n)[2]]
+            if plain80:
+                selected.append(server)
+        if operation == 'challenge-probe':
+            sys.stdout.write('yes' if selected else 'no')
+            sys.exit(0)
+        edits = []
+        for server in selected:
+            if any(n['args'][0] == 'include' for n in server['children']):
+                fail('cannot safely modify challenge routing hidden by server includes')
+            returns = directives(server, 'return')
+            if returns:
+                if not redirect(server):
+                    fail('server-level return precedes HTTP-01; adjust custom redirect manually')
+                node = returns[0]
+                edits.append((node['start'], node['end'], 'location / { ' + text[node['start']:node['end']] + ' }'))
+            challenge = [n for n in server['children'] if n['args'] == ['location', '^~', '/.well-known/acme-challenge/']]
+            if not challenge:
+                if any('/.well-known/acme-challenge' in ' '.join(n['args']) for n in server['children']):
+                    fail('custom challenge location requires manual review')
+                edits.append((server['opening'] + 1, server['opening'] + 1, '\n    location ^~ /.well-known/acme-challenge/ { root /usr/share/nginx/html; default_type "text/plain"; try_files $uri =404; }\n'))
+        for start, end, replacement in sorted(edits, reverse=True):
+            text = text[:start] + replacement + text[end:]
+        sys.stdout.write(text)
+        sys.exit(0)
+
     redirects = [s for s in servers if redirect(s)]
     apps = [s for s in servers if s not in redirects]
     if len(apps) != 1 or len(redirects) > 1:
@@ -219,11 +252,56 @@ try:
             edits.append((matches[0][0], matches[0][1], replacement))
         elif replacement:
             edits.append((0, 0, replacement))
+    def update_frontend(scheme, number):
+        # Only exact destinations produced by our Emby templates are managed.
+        if meta('managed_by') != 'Nginx-X' or meta('external_mode') not in ('emby_http', 'emby_https', 'emby_lily'):
+            return
+        sources = [meta('source_site_url') or meta('upstream_url')]
+        streams = (meta('stream_upstream_urls') or meta('stream_upstream_url')).split('|')
+        suffixes = {sources[0]: ''}
+        suffixes.update({v: '/s' + str(i + 1) for i, v in enumerate(streams) if v})
+        origin = scheme + '://' + domain + ('' if (scheme, number) in (('http', '80'), ('https', '443')) else ':' + number)
+        for node in walk(app):
+            args = node['args']
+            if len(args) != 3 or args[0] not in ('proxy_redirect', 'sub_filter'):
+                continue
+            source, dest = (v.strip("\"'") for v in args[1:])
+            if source not in suffixes:
+                continue
+            match = re.fullmatch(r'https?://' + re.escape(domain) + r'(?::[0-9]+)?(/s[0-9]+/?)?', dest)
+            if not match:
+                continue
+            tail = match[1] or ''
+            expected = {suffixes[source] + ('/' if args[0] == 'proxy_redirect' and suffixes[source] else '')}
+            if source == sources[0]:
+                expected.add('')
+            if tail not in expected:
+                continue
+            value = origin + tail
+            replace(node, args[0] + ' ' + args[1] + ' ' + ("'" + value + "'" if args[0] == 'sub_filter' else value) + ';')
+
     if operation == 'enable':
+        # Refuse aliases not covered by the selected certificate; never silently
+        # drop names or request additional certificates on the user's behalf.
+        certfile = ssl_dir.rstrip('/') + '/' + domain + '/fullchain.pem'
+        for alias in aliases:
+            if not re.fullmatch(r'[A-Za-z0-9.-]+', alias):
+                fail('certificate coverage cannot be established for server_name: ' + alias)
+            result = subprocess.run(['openssl', 'x509', '-in', certfile, '-noout', '-checkhost', alias], capture_output=True, text=True)
+            if result.returncode or 'does match certificate' not in result.stdout:
+                fail('certificate does not cover server_name ' + alias + '; install a certificate covering every alias first')
         if tls:
             if requested and port(requested) not in (parsed[0][1], '80' if parsed[0][1] == '443' else parsed[0][1]):
                 fail('already enabled; disable HTTPS before changing its port')
-            sys.stdout.write(original_text)
+            # Repair only known generated server-level redirects: these would
+            # otherwise preempt HTTP-01 even when the challenge location exists.
+            repaired = original_text
+            for server in reversed(redirects):
+                for node in reversed(directives(server, 'return')):
+                    repaired = repaired[:node['start']] + 'location / { ' + text[node['start']:node['end']] + ' }' + repaired[node['end']:]
+            if repaired != original_text and text != original_text:
+                fail('repair challenge redirect separately before enabling HTTPS')
+            sys.stdout.write(repaired)
             sys.exit(0)
         if redirects or any(n['args'][0].startswith('ssl_') or n['args'][0] in ('ssl', 'http2') for n in walk(app)):
             fail('existing TLS directives on a plain server are ambiguous')
@@ -246,7 +324,12 @@ try:
         block = 'server {\n' + '\n'.join(redirect_listens) + '\n    server_name ' + ' '.join(aliases) + ';\n'
         block += '    location ^~ /.well-known/acme-challenge/ {\n        root /usr/share/nginx/html;\n        default_type "text/plain";\n        try_files $uri =404;\n    }\n'
         block += '    location / { return 301 https://$host' + suffix + '$request_uri; }\n}\n\n'
-        edits.append((app['start'], app['start'], block))
+        # A certificate-only issuance may have installed a persistent challenge
+        # helper. Keep that endpoint rather than generating a duplicate :80 name.
+        helper = os.path.join((os.environ.get('NX_HTTPS_CONF_DIR') or os.path.dirname(filename)), 'acme-challenge-' + domain + '.conf')
+        if not os.path.exists(helper):
+            edits.append((app['start'], app['start'], block))
+        update_frontend('https', target)
         remap_defaults(original, target)
         setmeta('https_original_listen_port', original)
         setmeta('https_enabled', 'true')
@@ -265,6 +348,7 @@ try:
                 replace(node, '')
         for node in redirects:
             replace(node, '')
+        update_frontend('http', target)
         remap_defaults(parsed[0][1], target, removing_redirect=True)
         setmeta('https_enabled', 'false')
         setmeta('listen_port', target)
