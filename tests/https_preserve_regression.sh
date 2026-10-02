@@ -14,6 +14,12 @@ if [[ -z "$NGINX_TEST_BIN" ]]; then
   NGINX_TEST_BIN=/root/.openclaw/workspace/tmp/nginx-x-test-runtime/extracted/usr/sbin/nginx
 fi
 [[ -x "$NGINX_TEST_BIN" ]] || { echo 'Set NGINX_TEST_BIN to a real Nginx binary' >&2; exit 1; }
+# HTTPS migration deliberately retains the ACME listener on privileged port 80.
+# Some nginx builds bind listeners during -t, so CI needs sudo for validation.
+nginx_test_command=("$NGINX_TEST_BIN")
+if [[ ${EUID:-0} -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+  nginx_test_command=(sudo "$NGINX_TEST_BIN")
+fi
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=example.com \
   -keyout "$SSL_DIR/example.com/privkey.pem" -out "$SSL_DIR/example.com/fullchain.pem" >/dev/null 2>&1
 # Exercise the transformation through its public API, with real syntax validation.
@@ -38,7 +44,7 @@ http {
     include $candidate;
 }
 EOF
-  "$NGINX_TEST_BIN" -t -p "$TEST_ROOT" -c "$TEST_ROOT/nginx.conf" > "$TEST_ROOT/nginx-test.log" 2>&1 || {
+  "${nginx_test_command[@]}" -t -p "$TEST_ROOT" -c "$TEST_ROOT/nginx.conf" > "$TEST_ROOT/nginx-test.log" 2>&1 || {
     cat "$TEST_ROOT/nginx-test.log" >&2
     return 1
   }
@@ -220,7 +226,7 @@ SITE
 nginx_local_version() { echo 1.22.1; }
 reload_nginx_safe() {
   sed "s@include .*;@include $CONF_DIR/*.conf;@" "$TEST_ROOT/nginx.conf" > "$TEST_ROOT/integrated-nginx.conf"
-  "$NGINX_TEST_BIN" -t -p "$TEST_ROOT" -c "$TEST_ROOT/integrated-nginx.conf" > "$TEST_ROOT/nginx-test.log" 2>&1 || { cat "$TEST_ROOT/nginx-test.log" >&2; return 1; }
+  "${nginx_test_command[@]}" -t -p "$TEST_ROOT" -c "$TEST_ROOT/integrated-nginx.conf" > "$TEST_ROOT/nginx-test.log" 2>&1 || { cat "$TEST_ROOT/nginx-test.log" >&2; return 1; }
 }
 nx_access_set_policy "$conf" strict
 nx_access_set_default "$conf" '127.0.0.1:18080'
