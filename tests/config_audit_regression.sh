@@ -8,8 +8,14 @@ trap 'rm -rf "$T"' EXIT
 CONF_DIR="$T/conf"; SSL_DIR="$T/ssl"; DOMAIN_ONLY_STATE="$T/state"
 SUDO=""
 mkdir -p "$CONF_DIR" "$SSL_DIR/example.com"
-NGINX_TEST_BIN="${NGINX_TEST_BIN:-/root/.openclaw/workspace/tmp/nginx-x-test-runtime/extracted/usr/sbin/nginx}"
-[[ -x "$NGINX_TEST_BIN" ]] || exit 1
+NGINX_TEST_BIN="${NGINX_TEST_BIN:-$(command -v nginx || true)}"
+[[ -x "$NGINX_TEST_BIN" ]] || { echo 'Set NGINX_TEST_BIN to a real Nginx binary' >&2; exit 1; }
+# HTTPS transforms also generate a port-80 challenge listener. Elevate only
+# nginx -t; fixture writes must retain the unprivileged test user's ownership.
+nginx_test_command=("$NGINX_TEST_BIN")
+if [[ ${EUID:-0} -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+  nginx_test_command=(sudo "$NGINX_TEST_BIN")
+fi
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=example.com -addext subjectAltName=DNS:example.com,DNS:external.example -keyout "$SSL_DIR/example.com/privkey.pem" -out "$SSL_DIR/example.com/fullchain.pem" >/dev/null 2>&1
 cat > "$T/nginx.conf" <<NGINX
 pid $T/pid;
@@ -28,7 +34,7 @@ http {
 NGINX
 reload_nginx_safe() {
   printf 'apply\n' >> "$T/applies"
-  "$NGINX_TEST_BIN" -t -p "$T" -c "$T/nginx.conf" > "$T/nginx.log" 2>&1 || { cat "$T/nginx.log" >&2; return 1; }
+  "${nginx_test_command[@]}" -t -p "$T" -c "$T/nginx.conf" > "$T/nginx.log" 2>&1 || { cat "$T/nginx.log" >&2; return 1; }
   [[ ! -f "$T/fail" ]]
 }
 require_nginx_installed() { :; }
@@ -140,7 +146,7 @@ for listener in localhost:18080 '"18080"'; do
   [[ "$(extract_proxy_pass "$T/inspect")" == http://127.0.0.1:3000 ]]
   [[ "$(nx_conf_query summary "$T/inspect")" == 'example.com|18080|http://127.0.0.1:3000|false|' ]]
   printf 'pid %s/inspect.pid; error_log stderr; events {} http { access_log off; client_body_temp_path body; proxy_temp_path proxy; fastcgi_temp_path fastcgi; uwsgi_temp_path uwsgi; scgi_temp_path scgi; include %s/inspect; }\n' "$T" "$T" > "$T/inspect-main"
-  "$NGINX_TEST_BIN" -t -p "$T" -c "$T/inspect-main" > "$T/inspect.log" 2>&1 || { cat "$T/inspect.log"; exit 1; }
+  "${nginx_test_command[@]}" -t -p "$T" -c "$T/inspect-main" > "$T/inspect.log" 2>&1 || { cat "$T/inspect.log"; exit 1; }
   nx_conf_query keys "$T/inspect" > "$T/keys"
   if [[ "$listener" == localhost:* ]]; then
     grep -qx 'example.com|localhost:18080' "$T/keys"
@@ -163,7 +169,7 @@ grep -Fq "ssl_certificate_key \"$T/custom cert/privkey.pem\";" "$T/custom-new"
 grep -Fq 'ssl_protocols TLSv1.2;' "$T/custom-new"
 # shellcheck disable=SC2016
 printf 'pid %s/custom.pid; error_log stderr; events {} http { access_log off; client_body_temp_path body; proxy_temp_path proxy; fastcgi_temp_path fastcgi; uwsgi_temp_path uwsgi; scgi_temp_path scgi; map $http_upgrade $connection_upgrade { default upgrade; } include %s/custom-new; }\n' "$T" "$T" > "$T/custom-main"
-"$NGINX_TEST_BIN" -t -p "$T" -c "$T/custom-main" > "$T/custom.log" 2>&1 || { cat "$T/custom.log"; exit 1; }
+"${nginx_test_command[@]}" -t -p "$T" -c "$T/custom-main" > "$T/custom.log" 2>&1 || { cat "$T/custom.log"; exit 1; }
 build_proxy_conf example.com 18444 3001 "$T/custom-uncovered"
 sed -i 's/server_name example.com;/server_name example.com uncovered.example;/' "$T/custom-uncovered"
 cp "$T/custom-uncovered" "$T/custom-before"

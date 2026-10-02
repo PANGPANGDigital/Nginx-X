@@ -43,27 +43,81 @@ _issue_cert_dns example.com
 grep -Fq -- --reloadcmd "$ACME_LOG"
 [[ -x "$HOME/.acme.sh/nginxx-reload" ]]
 sh -n "$HOME/.acme.sh/nginxx-reload"
-# Exercise persisted hook in a fresh process with an isolated PATH. No host service.
-mkdir "$root/bin"
+# Exercise every persisted hook branch without inheriting host uid, PATH,
+# systemd state, or init scripts. Only environment paths are substituted.
+mkdir "$root/bin" "$root/systemd"
+cat > "$root/bin/id" <<'MOCK'
+#!/bin/sh
+printf '%s\n' "${HOOK_UID:-0}"
+MOCK
+cat > "$root/bin/sudo" <<'MOCK'
+#!/bin/sh
+printf 'sudo %s\n' "$*" >> "$HOOK_LOG"
+[ "$1" = -n ] || exit 90
+[ "${SUDO_FAIL:-0}" = 0 ] || exit "$SUDO_FAIL"
+shift
+HOOK_UID=0
+export HOOK_UID
+exec "$@"
+MOCK
 cat > "$root/bin/nginx" <<'MOCK'
 #!/bin/sh
-printf '%s\n' "$*" >> "$HOOK_LOG"
-[ "${HOOK_FAIL:-0}:$1" != 1:-t ]
+printf 'nginx %s\n' "$*" >> "$HOOK_LOG"
+case "$*" in
+    -t) exit "${HOOK_FAIL:-0}" ;;
+    '-s reload') exit "${RELOAD_FAIL:-0}" ;;
+    *) exit 91 ;;
+esac
 MOCK
-cat > "$root/bin/systemctl" <<'MOCK'
+cat > "$root/service-mock" <<'MOCK'
 #!/bin/sh
-printf 'reload\n' >> "$HOOK_LOG"
+printf '%s %s\n' "${0##*/}" "$*" >> "$HOOK_LOG"
 exit "${RELOAD_FAIL:-0}"
 MOCK
-chmod +x "$root/bin/"*
-sed "s|^PATH=.*|PATH=$root/bin:/usr/bin:/bin|" "$HOME/.acme.sh/nginxx-reload" > "$root/hook"
-export HOOK_LOG="$root/hook.log" HOOK_FAIL=1
-if sh "$root/hook"; then exit 1; fi
-[[ "$(wc -l < "$HOOK_LOG")" == 1 ]]
-export HOOK_FAIL=0 RELOAD_FAIL=1
-if sh "$root/hook"; then exit 1; fi
-export RELOAD_FAIL=0
-sh "$root/hook"
+chmod +x "$root/bin/"* "$root/service-mock"
+sed -e "s|^PATH=.*|PATH=$root/bin|" \
+    -e "s|/run/systemd/system|$root/systemd|g" \
+    -e "s|/etc/init.d/nginx|$root/init-nginx|g" \
+    "$HOME/.acme.sh/nginxx-reload" > "$root/hook"
+chmod +x "$root/hook"
+export HOOK_LOG="$root/hook.log" HOOK_UID=0 HOOK_FAIL=0 RELOAD_FAIL=0 SUDO_FAIL=0
+for service in systemd openrc sysv direct; do
+    rm -f "$root/bin/systemctl" "$root/bin/rc-service" "$root/init-nginx"
+    case "$service" in
+        systemd) cp "$root/service-mock" "$root/bin/systemctl"; expected='systemctl reload nginx' ;;
+        openrc) cp "$root/service-mock" "$root/bin/rc-service"; expected='rc-service nginx reload' ;;
+        sysv) cp "$root/service-mock" "$root/init-nginx"; expected='init-nginx reload' ;;
+        direct) expected='nginx -s reload' ;;
+    esac
+    for HOOK_UID in 0 1000; do
+        export HOOK_UID
+        : > "$HOOK_LOG"
+        export HOOK_FAIL=7 RELOAD_FAIL=0
+        status=0; "$root/hook" || status=$?
+        [[ "$status" == 7 ]]
+        [[ "$(grep -vc '^sudo ' "$HOOK_LOG")" == 1 ]]
+        grep -qx 'nginx -t' "$HOOK_LOG"
+        for RELOAD_FAIL in 8 0; do
+            : > "$HOOK_LOG"
+            export HOOK_FAIL=0 RELOAD_FAIL
+            status=0; "$root/hook" || status=$?
+            [[ "$status" == "$RELOAD_FAIL" ]]
+            printf 'nginx -t\n%s\n' "$expected" > "$root/expected"
+            sed '/^sudo /d' "$HOOK_LOG" > "$root/actual"
+            cmp "$root/expected" "$root/actual"
+            if [[ "$HOOK_UID" == 1000 ]]; then
+                grep -Fxq "sudo -n $root/hook" "$HOOK_LOG"
+            else
+                if grep -q '^sudo ' "$HOOK_LOG"; then exit 1; fi
+            fi
+        done
+    done
+done
+: > "$HOOK_LOG"
+export HOOK_UID=1000 SUDO_FAIL=9
+status=0; "$root/hook" || status=$?
+[[ "$status" == 9 && "$(wc -l < "$HOOK_LOG")" == 1 ]]
+unset HOOK_UID SUDO_FAIL
 grep -q '^nginx -t || exit' "$HOME/.acme.sh/nginxx-reload"
 grep -q '^0 3 \* \* \* ' "$root/cron"
 grep -q '^7 4 \* \* \* unrelated$' "$root/cron"
