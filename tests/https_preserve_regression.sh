@@ -5,6 +5,9 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$REPO_DIR/nx.sh"
 # shellcheck disable=SC1091
 source "$REPO_DIR/lib/https.sh"
+# Fixtures belong to the test user; only nginx -t may require elevation.
+# shellcheck disable=SC2034
+SUDO=""
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 SSL_DIR="$TEST_ROOT/ssl"
