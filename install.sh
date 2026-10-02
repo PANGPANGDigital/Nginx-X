@@ -5,7 +5,7 @@ REPO_URL="https://github.com/Xiuyixx/Nginx-X.git"
 REPO_BRANCH="main"
 INSTALL_DIR="${INSTALL_DIR:-/opt/Nginx-X}"
 TARGET_BIN="${TARGET_BIN:-/usr/local/bin/nx}"
-NO_RUN="0"
+NO_RUN="${NO_RUN:-0}"
 
 SUDO=""
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -73,16 +73,22 @@ install_local() {
     exit 1
   fi
 
-  ${SUDO} mkdir -p "$(dirname "$TARGET_BIN")"
-  local bundle
-  bundle="$(mktemp /tmp/nginxx-bundle-XXXXXX)"
-  if ! bash "${script_dir}/tools/build-bundle.sh" "$bundle"; then
+  [[ "$TARGET_BIN" == /* && "$TARGET_BIN" != */ ]] || { echo "[ERROR] TARGET_BIN must be an absolute file path"; return 1; }
+  ${SUDO} mkdir -p "$(dirname "$TARGET_BIN")" || return 1
+  # Resolve only the parent: replacing a symlink must not overwrite its target.
+  TARGET_BIN="$(cd "$(dirname "$TARGET_BIN")" && pwd -P)/$(basename "$TARGET_BIN")"
+  local bundle stage
+  bundle="$(mktemp /tmp/nginxx-bundle-XXXXXX)" || return 1
+  if ! NX_BUNDLE_TARGET="$TARGET_BIN" NX_BUNDLE_REPO="$script_dir" bash "${script_dir}/tools/build-bundle.sh" "$bundle"; then
     rm -f "$bundle"
-    exit 1
+    return 1
   fi
-  # A single executable contains one coherent revision of every module.
-  ${SUDO} install -m 0755 "$bundle" "${TARGET_BIN}.new"
-  ${SUDO} mv -f "${TARGET_BIN}.new" "$TARGET_BIN"
+  stage="$(${SUDO} mktemp "${TARGET_BIN}.stage.XXXXXX")" || { rm -f "$bundle"; return 1; }
+  if ! ${SUDO} install -m 0755 "$bundle" "$stage" || ! ${SUDO} mv -f "$stage" "$TARGET_BIN"; then
+    ${SUDO} rm -f "$stage"
+    rm -f "$bundle"
+    return 1
+  fi
   rm -f "$bundle"
 
   echo "[OK] Installed. You can now run: nx"
@@ -106,23 +112,9 @@ bootstrap_install() {
       echo "[ERROR] 拉取最新代码失败。"
       exit 1
     fi
-  elif [[ -e "$INSTALL_DIR" ]]; then
-    echo "[WARN] 目标目录已存在但不是 Git 仓库：$INSTALL_DIR"
-    if [[ -t 0 && -t 1 ]]; then
-      if ! confirm "是否清空该目录并重新安装？"; then
-        echo "[INFO] 已取消安装。"
-        exit 0
-      fi
-    else
-      echo "[ERROR] 非交互模式下不会自动删除已有目录，请先手动清理：$INSTALL_DIR"
-      exit 1
-    fi
-    ${SUDO} rm -rf "$INSTALL_DIR"
-    echo "[INFO] 已清理旧目录，重新克隆..."
-    if ! ${SUDO} git clone -b "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR"; then
-      echo "[ERROR] 克隆仓库失败。"
-      exit 1
-    fi
+  elif [[ -e "$INSTALL_DIR" || -L "$INSTALL_DIR" ]]; then
+    echo "[ERROR] 目标目录已存在且不是 Git 仓库；保留原目录：$INSTALL_DIR"
+    return 1
   else
     echo "[INFO] 克隆仓库到 $INSTALL_DIR"
     if ! ${SUDO} git clone -b "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR"; then
@@ -136,7 +128,7 @@ bootstrap_install() {
     exit 1
   fi
 
-  if [[ -t 0 && -t 1 ]]; then
+  if [[ "$NO_RUN" != "1" && -t 0 && -t 1 ]]; then
     read -rp "是否立即启动 Nginx-X？[y/N]: " run_now
     if [[ "$run_now" =~ ^[Yy]$ ]]; then
       echo "[OK] 安装完成，正在启动 Nginx-X..."

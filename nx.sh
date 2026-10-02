@@ -25,6 +25,7 @@ fi
 CONF_DIR="${NX_CONF_DIR:-$CONF_DIR}"
 SSL_DIR="${SSL_DIR:-/etc/nginx/ssl}"
 NGINX_MAIN_CONF="${NGINX_MAIN_CONF:-/etc/nginx/nginx.conf}"
+NX_RUNNING_SOURCE="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="${STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/nginxx}"
 EMAIL_CONF="${STATE_DIR}/email.conf"
@@ -81,6 +82,42 @@ check_cmd() {
   local p
   p="$(command -v "$1" 2>/dev/null || true)"
   [[ -n "$p" && -x "$p" ]]
+}
+
+# Called only by explicit lifecycle actions / main, never while sourcing modules.
+ensure_runtime_dependencies() {
+  local cmd pkg
+  local -a missing=()
+  for cmd in python3 curl openssl awk sed grep tar; do
+    check_cmd "$cmd" || missing+=("$cmd")
+  done
+  [[ ${#missing[@]} -gt 0 ]] || return 0
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    if ! check_cmd sudo || ! sudo -v; then
+      error "补齐依赖需要 sudo 权限：${missing[*]}"; return 1
+    fi
+  fi
+  pkg="$(detect_pkg_mgr)"
+  case "$pkg" in
+    apt) ${SUDO} apt-get update && ${SUDO} apt-get install -y python3 curl openssl gawk sed grep tar ;;
+    dnf|yum) ${SUDO} "$pkg" install -y python3 curl openssl gawk sed grep tar ;;
+    apk) ${SUDO} apk add python3 curl openssl gawk sed grep tar ;;
+    opkg) ${SUDO} opkg update && ${SUDO} opkg install python3 curl openssl-util gawk sed grep tar ;;
+    *) error "请先安装依赖：${missing[*]}"; return 1 ;;
+  esac || return 1
+  for cmd in "${missing[@]}"; do
+    check_cmd "$cmd" || { error "依赖仍不可用：$cmd"; return 1; }
+  done
+}
+
+installed_script_target() {
+  local running
+  running="$(readlink -f "$NX_RUNNING_SOURCE")" || return 1
+  if [[ -z "${NX_INSTALLED_TARGET:-}" || "$running" != "$NX_INSTALLED_TARGET" ]]; then
+    error "当前文件不是已登记的安装入口；请用 install.sh 安装后再更新/卸载。" >&2
+    return 1
+  fi
+  printf '%s\n' "$running"
 }
 
 require_nginx_installed() {
@@ -178,7 +215,7 @@ reload_nginx_safe() {
 }
 
 ensure_dirs() {
-  ${SUDO} mkdir -p "$CONF_DIR"
+  ${SUDO} mkdir -p "$CONF_DIR" || return 1
   ${SUDO} mkdir -p "$SSL_DIR"
 }
 
@@ -492,7 +529,8 @@ install_nginx_official() {
   os_id="$(detect_os_id)"
   pkg="$(detect_pkg_mgr)"
 
-  ensure_dirs
+  ensure_runtime_dependencies || return 1
+  ensure_dirs || return 1
 
   if check_cmd nginx; then
     warn "检测到 Nginx 已安装，跳过安装步骤。"
@@ -526,7 +564,7 @@ install_nginx_official() {
         return 1
       fi
       # shellcheck disable=SC1091
-      echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/$(. /etc/os-release; echo "${ID}") $(lsb_release -cs) nginx" | ${SUDO} tee /etc/apt/sources.list.d/nginx.list >/dev/null
+      echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/$(. /etc/os-release; echo "${ID}") $(lsb_release -cs) nginx" | ${SUDO} tee /etc/apt/sources.list.d/nginx.list >/dev/null || return 1
       if ! ${SUDO} apt-get update; then
         error "Nginx 官方源刷新失败。请检查网络连接、软件源配置或稍后重试。"
         return 1
@@ -547,7 +585,7 @@ install_nginx_official() {
       fi
 
       note "配置 Nginx 官方 stable 源..."
-      cat <<'REPO' | ${SUDO} tee /etc/yum.repos.d/nginx.repo >/dev/null
+      cat <<'REPO' | ${SUDO} tee /etc/yum.repos.d/nginx.repo >/dev/null || return 1
 [nginx-stable]
 name=nginx stable repo
 baseurl=https://nginx.org/packages/centos/$releasever/$basearch/
@@ -591,17 +629,17 @@ REPO
   esac
 
   if check_cmd systemctl; then
-    ${SUDO} systemctl enable --now nginx || true
+    ${SUDO} systemctl enable --now nginx || return 1
     ${SUDO} systemctl enable --now cron 2>/dev/null || ${SUDO} systemctl enable --now crond 2>/dev/null || true
   elif check_cmd rc-service; then
     ${SUDO} rc-update add nginx default 2>/dev/null || true
-    ${SUDO} rc-service nginx start 2>/dev/null || true
+    ${SUDO} rc-service nginx start 2>/dev/null || return 1
     ${SUDO} rc-update add dcron default 2>/dev/null || ${SUDO} rc-update add crond default 2>/dev/null || true
     ${SUDO} rc-service dcron start 2>/dev/null || ${SUDO} rc-service crond start 2>/dev/null || true
   fi
 
   # 安装后自动停用可能引发冲突的默认配置
-  disable_default_conf_if_exists
+  disable_default_conf_if_exists || return 1
 
   # 安装后重新检测 conf 目录（Alpine 装完才有 http.d）
   if [[ -d /etc/nginx/http.d ]]; then
@@ -667,7 +705,10 @@ upgrade_nginx_smart() {
 
   backup_dir="/etc/nginx-backup-$(date +%F-%H%M%S)"
   note "检测到可升级版本，先备份配置到：${backup_dir}"
-  ${SUDO} cp -a /etc/nginx "$backup_dir"
+  if ! ${SUDO} cp -a /etc/nginx "$backup_dir"; then
+    error "配置备份失败，已取消升级。"
+    return 1
+  fi
 
   pkg="$(detect_pkg_mgr)"
   case "$pkg" in
@@ -751,9 +792,10 @@ upgrade_nginx_smart() {
 
 # ---------- 功能1：安装升级Nginx（合并入口） ----------
 install_or_upgrade_nginx() {
+  ensure_runtime_dependencies || return 1
   # 未安装时先安装；已安装时走智能升级逻辑
   if ! check_cmd nginx; then
-    install_nginx_official
+    install_nginx_official || return 1
     auto_import_after_install
   else
     upgrade_nginx_smart
@@ -2099,17 +2141,56 @@ auto_import_after_install() {
 }
 
 # ---------- DNS 服务器管理 ----------
+valid_dns_address() {
+  python3 - "$1" <<'PYDNS'
+import ipaddress, sys
+try:
+    value = sys.argv[1]
+    if "%" in value:
+        raise ValueError("scope is not supported")
+    ipaddress.ip_address(value)
+except ValueError:
+    sys.exit(1)
+PYDNS
+}
+
+write_system_dns() {
+  local target="$1" ns1="$2" ns2="${3:-}" stage backup
+  [[ "$target" == /* && "$target" != */ ]] || return 1
+  valid_dns_address "$ns1" || return 1
+  [[ -z "$ns2" ]] || valid_dns_address "$ns2" || return 1
+  # Stage beside the destination: failed install/rename never unlinks the original.
+  stage="$(${SUDO} mktemp "${target}.stage.XXXXXX")" || return 1
+  backup="$(${SUDO} mktemp -d "${target}.backup.XXXXXX")" || { ${SUDO} rm -f "$stage"; return 1; }
+  if [[ -e "$target" || -L "$target" ]]; then
+    if ! ${SUDO} cp -a "$target" "$backup/resolv.conf"; then
+      ${SUDO} rm -f "$stage"; ${SUDO} rmdir "$backup"; return 1
+    fi
+  fi
+  local tmp
+  tmp="$(mktemp)" || { ${SUDO} rm -f "$stage"; return 1; }
+  { printf '# Generated by Nginx-X\nnameserver %s\n' "$ns1"; if [[ -n "$ns2" ]]; then printf 'nameserver %s\n' "$ns2"; fi; } > "$tmp"
+  if ! install_managed_file "$tmp" "$stage" || ! ${SUDO} mv -f "$stage" "$target"; then
+    rm -f "$tmp"; ${SUDO} rm -f "$stage"
+    error "写入失败；原文件/链接未替换，备份：$backup"
+    return 1
+  fi
+  rm -f "$tmp"
+  note "原 DNS 文件/链接备份：$backup"
+}
+
 dns_setup_menu() {
+  local resolv_path="${NX_RESOLV_CONF:-/etc/resolv.conf}"
   while true; do
     clear
     echo "========== 系统 DNS 设置 =========="
     echo "当前 DNS 配置："
-    if [[ -f /etc/resolv.conf ]]; then
-      grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | while read -r line; do
+    if [[ -f "$resolv_path" ]]; then
+      grep -E '^nameserver' "$resolv_path" 2>/dev/null | while read -r line; do
         echo "  ${line}"
       done
     else
-      echo "  (未找到 /etc/resolv.conf)"
+      echo "  (未找到 ${resolv_path})"
     fi
     echo ""
     echo "预设 DNS："
@@ -2138,6 +2219,12 @@ dns_setup_menu() {
       *) warn "无效输入。请输入 0-8 之间的菜单编号。"; pause; continue ;;
     esac
 
+    if ! valid_dns_address "$ns1" || { [[ -n "$ns2" ]] && ! valid_dns_address "$ns2"; }; then
+      error "DNS 必须是有效的 IPv4 或 IPv6 地址。"
+      pause
+      continue
+    fi
+
     if [[ -z "$ns1" ]]; then
       continue
     fi
@@ -2145,9 +2232,9 @@ dns_setup_menu() {
     # 保护现有系统：检测 resolv.conf 是否被系统服务托管（systemd-resolved / resolvconf / NetworkManager 等）。
     # 直接覆盖它的目标会在服务下次重新生成时恢复，也会破坏系统 DNS 管理。
     local managed_by=""
-    if [[ -L /etc/resolv.conf ]]; then
+    if [[ -L "$resolv_path" ]]; then
       local link_target
-      link_target="$(readlink -f /etc/resolv.conf 2>/dev/null || readlink /etc/resolv.conf)"
+      link_target="$(readlink -f "$resolv_path" 2>/dev/null || readlink "$resolv_path")"
       case "$link_target" in
         */systemd/resolve/*) managed_by="systemd-resolved" ;;
         */resolvconf/*)      managed_by="resolvconf" ;;
@@ -2161,34 +2248,24 @@ dns_setup_menu() {
     fi
 
     if [[ -n "$managed_by" ]]; then
-      warn "检测到 /etc/resolv.conf 由 ${managed_by} 接管。"
+      warn "检测到 ${resolv_path} 由 ${managed_by} 接管。"
       warn "直接覆盖会被系统重写，且可能破坏现有 DNS 服务。"
       warn "建议通过对应服务配置修改 DNS（如 systemd-resolved / netplan / NetworkManager）。"
-      if ! confirm "确认仍要直接覆写 /etc/resolv.conf？"; then
+      if ! confirm "确认仍要直接覆写 ${resolv_path}？"; then
         info "已取消。"
         pause
         continue
       fi
     fi
 
-    local tmp_resolv
-    tmp_resolv="$(mktemp /tmp/nginxx-resolv-XXXXXX)"
-    {
-      echo "# Generated by Nginx-X"
-      echo "nameserver ${ns1}"
-      [[ -n "$ns2" ]] && echo "nameserver ${ns2}"
-    } > "$tmp_resolv"
-
-    # 如果 resolv.conf 是符号链接，先删除链接再写入普通文件，避免写回链接目标目录。
-    ${SUDO} cp -a /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true
-    if [[ -L /etc/resolv.conf ]]; then
-      ${SUDO} rm -f /etc/resolv.conf
+    if ! write_system_dns "$resolv_path" "$ns1" "$ns2"; then
+      error "DNS 更新失败，原配置已保留。"
+      pause
+      continue
     fi
-    install_managed_file "$tmp_resolv" /etc/resolv.conf
-    rm -f "$tmp_resolv"
 
     info "DNS 已更新为：${ns1}${ns2:+ + ${ns2}}"
-    warn "注意：/etc/resolv.conf 可能在系统重启或 DHCP 续租后被覆盖。"
+    warn "注意：${resolv_path} 可能在系统重启或 DHCP 续租后被覆盖。"
     pause
   done
 }
@@ -2721,14 +2798,39 @@ EOF
   rm -f "$tmp_status"
 }
 
+sample_clock() {
+  # Linux uptime is monotonic, including BusyBox systems.
+  awk '{print $1}' /proc/uptime
+}
+
+sample_rate() {
+  awk -v now="$1" -v prev="$2" -v elapsed="$3" -v scale="${4:-1}" 'BEGIN {d=now-prev; if(d<0)d=0; if(elapsed<=0){print "N/A";exit} printf "%.2f", d/elapsed/scale}'
+}
+
+nginx_proc_counters() {
+  local st line rest
+  local -a fields
+  for st in /proc/[0-9]*/stat; do
+    IFS= read -r line < "$st" 2>/dev/null || continue
+    [[ "$line" == *'(nginx)'* ]] || continue
+    rest="${line##*) }"
+    read -r -a fields <<< "$rest"
+    [[ ${#fields[@]} -ge 22 ]] || continue
+    printf '%s %s\n' "$((fields[11]+fields[12]))" "${fields[21]}"
+  done | awk '{ticks+=$1;rss+=$2} END {printf "%.0f %.0f\n",ticks,rss}'
+}
+
 show_nginx_realtime_status() {
   require_nginx_installed || return 1
 
   ensure_status_endpoint || true
 
-  local prev_requests=0 prev_rx=0 prev_tx=0 initialized=0
+  local prev_requests=0 prev_rx=0 prev_tx=0 initialized=0 prev_time=0 prev_ticks=0
 
   while true; do
+    local now elapsed
+    now="$(sample_clock)"
+    elapsed="$(awk -v n="$now" -v p="$prev_time" 'BEGIN{print n-p}')"
     local stat active reading writing waiting accepts handled requests qps
     local cpu mem workers master_pid start_time rx tx rx_rate tx_rate
 
@@ -2754,48 +2856,20 @@ show_nginx_realtime_status() {
     fi
 
     if [[ $initialized -eq 1 ]]; then
-      qps="$(awk -v current="$requests" -v previous="$prev_requests" 'BEGIN { delta=current-previous; if (delta<0) delta=0; printf "%.1f", delta/5 }')"
+      qps="$(sample_rate "$requests" "$prev_requests" "$elapsed")"
     fi
 
-    # ps -C/-o 为 procps 语法，BusyBox 不可用；回退解析 /proc/<pid>/stat（CPU 为有符号整数百分比，除以核心数）
-    local ncpu=1
-    ncpu="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
-    case "$ncpu" in
-      ''|*[!0-9]*) ncpu=1 ;;
-    esac
-    local cpu_val mem_val
-    cpu_val="$(ps -C nginx -o %cpu= 2>/dev/null | awk '{s+=$1} END {if(NR==0) print "0.0"; else printf "%.1f", s}')"
-    if [[ "${cpu_val:-0.0}" == "0.0" ]] && [[ -z "$(ps -C nginx -o pid= 2>/dev/null)" ]]; then
-      cpu_val="$(for st in /proc/[0-9]*/stat; do
-        read -r line < "$st" 2>/dev/null || continue
-        [[ "$line" == *'nginx'* ]] || continue
-        # shellcheck disable=SC2086  # 刻意按空白拆分；nginx 进程名含空格/括号时 procstat 取不到
-        set -- $line
-        # 字段 14=utime, 15=stime（含 comm 括号偏移后取 $14/$15）
-        echo "${14} ${15}"
-      done | awk -v n="$ncpu" -v hz="$(getconf CLK_TCK 2>/dev/null || echo 100)" '{ut+=$1; st+=$2} END {if(NR==0) print "0.0"; else printf "%.1f", (ut+st)/hz*100/n/100}')"
+    local ticks rss hz page_size mem_total
+    read -r ticks rss < <(nginx_proc_counters)
+    hz="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+    page_size="$(getconf PAGESIZE 2>/dev/null || echo 4096)"
+    mem_total="$(awk '/^MemTotal:/{print $2}' /proc/meminfo)"
+    cpu="N/A"
+    if [[ $initialized -eq 1 ]]; then
+      cpu="$(sample_rate "$ticks" "$prev_ticks" "$elapsed" "$(awk -v h="$hz" 'BEGIN{print h/100}')")"
     fi
-    # mem: ps -o %mem= 不可用时回退 /proc/stat 的 rss 字段（第 24 字段，单位页）× 页大小 / MemTotal
-    mem_val="$(ps -C nginx -o %mem= 2>/dev/null | awk '{s+=$1} END {if(NR==0) print "0.0"; else printf "%.1f", s}')"
-    if [[ "${mem_val:-0.0}" == "0.0" ]] && [[ -z "$(ps -C nginx -o pid= 2>/dev/null)" ]]; then
-      local page_size mem_total
-      page_size="$(getconf PAGESIZE 2>/dev/null || echo 4096)"
-      mem_total="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)"
-      case "$mem_total" in
-        ''|*[!0-9]*) mem_total=0 ;;
-      esac
-      if [[ "$mem_total" -gt 0 ]]; then
-        mem_val="$(for st in /proc/[0-9]*/stat; do
-          read -r line < "$st" 2>/dev/null || continue
-          [[ "$line" == *'nginx'* ]] || continue
-          # shellcheck disable=SC2086  # 刻意按空白拆分（同上）
-          set -- $line
-          echo "${24}"
-        done | awk -v ps="$page_size" -v mt="$mem_total" '{rss+=$1} END {if(NR==0) print "0.0"; else printf "%.1f", rss*ps/1024/mt*100}')"
-      fi
-    fi
-    cpu="${cpu_val:-0.0}"
-    mem="${mem_val:-0.0}"
+    prev_ticks="$ticks"
+    mem="$(awk -v r="$rss" -v p="$page_size" -v m="$mem_total" 'BEGIN{if(m>0)printf "%.1f",r*p/1024/m*100;else print "N/A"}')"
 
     workers="$(pgrep -fc 'nginx: worker process' 2>/dev/null || echo 0)"
     master_pid="$(pgrep -xo nginx 2>/dev/null || true)"
@@ -2810,8 +2884,8 @@ show_nginx_realtime_status() {
     tx="$(sed 's/^[[:space:]]*//' /proc/net/dev 2>/dev/null | awk -F'[: ]+' 'NR>2 && $1!="lo" {s+=$10} END{print s+0}')"
 
     if [[ $initialized -eq 1 ]]; then
-      rx_rate="$(awk -v d=$((rx-prev_rx)) 'BEGIN{if(d<0)d=0; printf "%.1f", d/1024/1024}')"
-      tx_rate="$(awk -v d=$((tx-prev_tx)) 'BEGIN{if(d<0)d=0; printf "%.1f", d/1024/1024}')"
+      rx_rate="$(sample_rate "$rx" "$prev_rx" "$elapsed" 1048576)"
+      tx_rate="$(sample_rate "$tx" "$prev_tx" "$elapsed" 1048576)"
     else
       rx_rate="0.0"
       tx_rate="0.0"
@@ -2819,6 +2893,7 @@ show_nginx_realtime_status() {
     fi
 
     prev_requests="$requests"
+    prev_time="$now"
     prev_rx="$rx"
     prev_tx="$tx"
 
@@ -2849,8 +2924,8 @@ Worker进程: ${workers}
 启动时间: ${start_time}
 
 网络流量
-RX: ${rx_rate} MB/s
-TX: ${tx_rate} MB/s
+RX: ${rx_rate} MiB/s
+TX: ${tx_rate} MiB/s
 
 ==============================
 按回车返回（每5秒自动刷新）
@@ -2866,25 +2941,28 @@ EOF
 show_traffic_stats() {
   require_nginx_installed || return 1
 
-  local log_file="/var/log/nginx/access.log"
   local host_log_file="/var/log/nginx/access.host.log"
-  local prev_rx=0 prev_tx=0 initialized=0
+  local prev_rx=0 prev_tx=0 initialized=0 prev_time=0
 
   while true; do
+    local now elapsed
+    now="$(sample_clock)"
+    elapsed="$(awk -v n="$now" -v p="$prev_time" 'BEGIN{print n-p}')"
     local rx tx rx_rate tx_rate rx_total_mb tx_total_mb
     # Strip leading whitespace so $1 is always the interface name
     rx="$(sed 's/^[[:space:]]*//' /proc/net/dev 2>/dev/null | awk -F'[: ]+' 'NR>2 && $1!="lo" {s+=$2} END{print s+0}')"
     tx="$(sed 's/^[[:space:]]*//' /proc/net/dev 2>/dev/null | awk -F'[: ]+' 'NR>2 && $1!="lo" {s+=$10} END{print s+0}')"
 
     if [[ $initialized -eq 1 ]]; then
-      rx_rate="$(awk -v d=$((rx-prev_rx)) 'BEGIN{if(d<0)d=0; printf "%.2f", d/1024/1024}')"
-      tx_rate="$(awk -v d=$((tx-prev_tx)) 'BEGIN{if(d<0)d=0; printf "%.2f", d/1024/1024}')"
+      rx_rate="$(sample_rate "$rx" "$prev_rx" "$elapsed" 1048576)"
+      tx_rate="$(sample_rate "$tx" "$prev_tx" "$elapsed" 1048576)"
     else
       rx_rate="0.00"
       tx_rate="0.00"
       initialized=1
     fi
 
+    prev_time="$now"
     prev_rx="$rx"
     prev_tx="$tx"
     rx_total_mb="$(awk -v b="$rx" 'BEGIN{printf "%.2f", b/1024/1024}')"
@@ -2899,8 +2977,8 @@ show_traffic_stats() {
 总流量（系统网卡）
 RX总量: ${rx_total_mb} MB
 TX总量: ${tx_total_mb} MB
-RX速率: ${rx_rate} MB/s
-TX速率: ${tx_rate} MB/s
+RX速率: ${rx_rate} MiB/s
+TX速率: ${tx_rate} MiB/s
 
 当前启用配置流量（最近5000日志，优先按 Host 专用日志统计）
 EOF
@@ -2909,27 +2987,20 @@ EOF
     if [[ ${#enabled_confs[@]} -eq 0 ]]; then
       echo "- 无启用配置"
     else
+      local totals="" conf
+      if [[ -r "$host_log_file" ]]; then
+        totals="$(tail -n 5000 "$host_log_file" | awk '$2 ~ /^[0-9]+$/ {c[$1]++;b[$1]+=$2} END{for(h in c)printf "%s %d %.0f\n",h,c[h],b[h]}')" || totals=""
+      fi
       for conf in "${enabled_confs[@]}"; do
         local domain req_count bytes_sum bytes_mb
         domain="$(extract_domain_from_conf "$conf")"
-
-        if [[ -f "$host_log_file" && -n "$domain" ]]; then
-          req_count="$(tail -n 5000 "$host_log_file" 2>/dev/null | awk -v d="$domain" '$1==d {c++} END{print c+0}')"
-          bytes_sum="$(tail -n 5000 "$host_log_file" 2>/dev/null | awk -v d="$domain" '$1==d && $2 ~ /^[0-9]+$/ {s+=$2} END{print s+0}')"
-        elif [[ -f "$log_file" && -n "$domain" ]]; then
-          req_count="$(tail -n 5000 "$log_file" 2>/dev/null | grep -F -c "$domain" || true)"
-          bytes_sum="$(tail -n 5000 "$log_file" 2>/dev/null | grep -F "$domain" | awk '{if($10 ~ /^[0-9]+$/) s+=$10} END{print s+0}' || true)"
-        else
-          req_count="0"
-          bytes_sum="0"
+        if [[ ! -r "$host_log_file" || -z "$domain" ]]; then
+          echo "- $(basename "$conf") | 域名: ${domain} | 无法统计：需要 Host 专用日志 access.host.log"
+          continue
         fi
-
-        bytes_mb="$(awk -v b="$bytes_sum" 'BEGIN{printf "%.2f", b/1024/1024}')"
-        if [[ -f "$host_log_file" ]]; then
-          echo "- $(basename "$conf") | 域名: ${domain} | 请求: ${req_count} | 下行: ${bytes_mb} MB | 来源: host日志"
-        else
-          echo "- $(basename "$conf") | 域名: ${domain} | 请求: ${req_count} | 下行: ${bytes_mb} MB | 来源: access估算"
-        fi
+        read -r req_count bytes_sum < <(awk -v d="$domain" '$1==d {c=$2;b=$3} END{print c+0,b+0}' <<< "$totals")
+        bytes_mb="$(awk -v b="$bytes_sum" 'BEGIN{printf "%.2f",b/1024/1024}')"
+        echo "- $(basename "$conf") | 域名: ${domain} | 请求: ${req_count} | 下行: ${bytes_mb} MiB | 来源: host日志（同域名共享统计）"
       done
     fi
 
@@ -2973,22 +3044,16 @@ realtime_info_menu() {
 
 # ---------- 功能7：卸载 ----------
 uninstall_script_only() {
-  note "将执行：卸载 nx 快捷命令、删除脚本目录下运行文件。"
+  note "将执行：卸载当前已登记的 nx 安装入口。"
   if ! confirm "确认继续卸载本脚本？"; then
     info "已取消。"
     return 0
   fi
 
-  # 1) 清理快捷启动命令
   local installed_bin
-  installed_bin="$(command -v nx 2>/dev/null || true)"
-  [[ -n "$installed_bin" ]] || installed_bin="/usr/local/bin/nx"
-  if [[ -f "$installed_bin" ]]; then
-    ${SUDO} rm -f "$installed_bin"
-    info "已移除：${installed_bin}"
-  else
-    warn "未发现 /usr/local/bin/nx，跳过。"
-  fi
+  installed_bin="$(installed_script_target)" || return 1
+  ${SUDO} rm -f "$installed_bin" || return 1
+  info "已移除：${installed_bin}"
 
   # 2) 清理脚本目录下运行状态文件
   rm -f "$EMAIL_CONF" 2>/dev/null || true
@@ -3012,62 +3077,28 @@ uninstall_script_only() {
 uninstall_nginx_only() {
   local pkg
   pkg="$(detect_pkg_mgr)"
-
-  warn "将彻底卸载 Nginx 并清空相关配置/日志目录。"
-  warn "将删除：/etc/nginx /var/log/nginx /var/cache/nginx /usr/share/nginx"
-  if ! confirm "确认继续卸载 Nginx？"; then
-    info "已取消。"
-    return 0
-  fi
-
-  if ! confirm "这是高风险操作，是否再次确认卸载 Nginx？"; then
-    info "已取消。"
-    return 0
-  fi
-
+  warn "将卸载 Nginx 软件包；保留配置、证书和日志供恢复。"
+  confirm "确认继续卸载 Nginx？" || return 0
   if check_cmd systemctl; then
-    ${SUDO} systemctl stop nginx 2>/dev/null || true
-    ${SUDO} systemctl disable nginx 2>/dev/null || true
+    ${SUDO} systemctl stop nginx || { error "停止失败，已取消卸载。"; return 1; }
   elif check_cmd rc-service; then
-    ${SUDO} rc-service nginx stop 2>/dev/null || true
-    ${SUDO} rc-update del nginx 2>/dev/null || true
-  fi
-
-  case "$pkg" in
-    apt)
-      ${SUDO} apt-get purge -y 'nginx*' || true
-      ${SUDO} apt-get autoremove -y || true
-      ${SUDO} rm -f /etc/apt/sources.list.d/nginx.list || true
-      ;;
-    dnf|yum)
-      ${SUDO} "$pkg" remove -y 'nginx*' || true
-      ${SUDO} rm -f /etc/yum.repos.d/nginx.repo || true
-      ;;
-    apk)
-      ${SUDO} apk del nginx nginx-mod-stream 2>/dev/null || true
-      ;;
-    opkg)
-      ${SUDO} opkg remove nginx 2>/dev/null || true
-      ;;
-    *)
-      warn "未知包管理器，尝试仅清理目录。"
-      ;;
-  esac
-
-  ${SUDO} rm -rf /etc/nginx /var/log/nginx /var/cache/nginx /usr/share/nginx/html /usr/share/nginx 2>/dev/null || true
-
-  # Double-check if any core dirs still exist (best-effort)
-  local -a leftovers=()
-  for p in /etc/nginx /var/log/nginx /var/cache/nginx /usr/share/nginx; do
-    if [[ -e "$p" ]]; then
-      leftovers+=("$p")
-    fi
-  done
-  if [[ ${#leftovers[@]} -gt 0 ]]; then
-    warn "已尝试清理 Nginx 目录，但仍检测到残留：${leftovers[*]}（可能被其他程序占用或权限限制）"
+    ${SUDO} rc-service nginx stop || return 1
   else
-    info "Nginx 及其配置已清理完成。"
+    ${SUDO} service nginx stop || return 1
   fi
+  case "$pkg" in
+    apt) ${SUDO} apt-get remove -y nginx || return 1 ;;
+    dnf|yum) ${SUDO} "$pkg" remove -y nginx || return 1 ;;
+    apk) ${SUDO} apk del nginx || return 1 ;;
+    opkg) ${SUDO} opkg remove nginx || return 1 ;;
+    *) error "未知包管理器，未清理任何目录。"; return 1 ;;
+  esac
+  hash -r
+  if check_cmd nginx; then
+    error "仍检测到 Nginx 可执行文件，请检查其他安装来源；配置已保留。"
+    return 1
+  fi
+  info "Nginx 软件包已卸载，配置、证书及日志已保留。"
 }
 
 uninstall_acme_only() {
@@ -3103,8 +3134,8 @@ uninstall_acme_only() {
 }
 
 uninstall_all() {
-  warn "将执行全部卸载：本脚本 + Nginx（含配置清理）。"
-  warn "该操作会同时清理 Nginx、证书、脚本入口和相关目录。"
+  warn "将卸载本脚本、Nginx 软件包和 Acme；Nginx 配置/日志保留。"
+  warn "该操作会清理证书和脚本入口。"
   if ! confirm "确认继续全部卸载？"; then
     info "已取消。"
     return 0
@@ -3115,8 +3146,8 @@ uninstall_all() {
     return 0
   fi
 
-  uninstall_nginx_only
-  uninstall_acme_only
+  uninstall_nginx_only || return 1
+  uninstall_acme_only || return 1
   uninstall_script_only
 }
 
@@ -3125,9 +3156,9 @@ uninstall_menu() {
     clear
     echo "========== 卸载 =========="
     echo "1) 卸载脚本（彻底卸载本脚本并清理）"
-    echo "2) 卸载 Nginx（彻底卸载并清空 Nginx 配置）"
+    echo "2) 卸载 Nginx（保留配置和日志）"
     echo "3) 卸载 Acme（彻底卸载并清空 Acme 配置/邮箱信息）"
-    echo "4) 全部卸载（脚本 + Nginx + Acme 全清理）"
+    echo "4) 卸载脚本 + Nginx + Acme（保留 Nginx 配置/日志）"
     echo "0) 返回上一级"
     echo "=========================="
     read -rp "请选择: " c
@@ -3154,11 +3185,15 @@ update_script() {
   # 优先使用当前脚本所在目录（如果它本身是个 git 仓库），
   # 其次 fallback 到传统安装目录 REPO_INSTALL_DIR（/opt/Nginx-X）。
   # 以适配安装到非标准路径 / 开发环境直接运行的场景。
-  local work_dir=""
-  if [[ -n "${SCRIPT_DIR:-}" && -d "${SCRIPT_DIR}/.git" ]]; then
-    work_dir="${SCRIPT_DIR}"
-  elif [[ -d "${REPO_INSTALL_DIR}/.git" ]]; then
-    work_dir="${REPO_INSTALL_DIR}"
+  local work_dir="" target_bin
+  target_bin="$(installed_script_target)" || return 1
+  local source_repo="${NX_INSTALLED_REPO:-$REPO_INSTALL_DIR}"
+  if ! check_cmd git; then
+    error "更新需要 git，请先安装 git。"
+    return 1
+  fi
+  if [[ -e "$source_repo/.git" ]]; then
+    work_dir="$source_repo"
   fi
 
   note "正在从 ${REPO_URL} (分支: ${REPO_BRANCH}) 更新脚本..."
@@ -3180,30 +3215,16 @@ update_script() {
       error "拉取最新代码失败，请检查网络或手动更新。"
       return 1
     fi
-  elif [[ -d "${REPO_INSTALL_DIR}" ]]; then
-    warn "安装目录存在但不是 Git 仓库，将重新克隆..."
-    ${SUDO} rm -rf "${REPO_INSTALL_DIR}"
-    if ! ${SUDO} git clone -b "${REPO_BRANCH}" "${REPO_URL}" "${REPO_INSTALL_DIR}"; then
-      error "克隆仓库失败，请检查网络。"
-      return 1
-    fi
-    work_dir="${REPO_INSTALL_DIR}"
+  elif [[ -e "$source_repo" || -L "$source_repo" ]]; then
+    error "安装目录存在但不是 Git 仓库，已保留：$source_repo"
+    return 1
   else
-    if ! ${SUDO} git clone -b "${REPO_BRANCH}" "${REPO_URL}" "${REPO_INSTALL_DIR}"; then
-      error "克隆仓库失败，请检查网络。"
+    if ! ${SUDO} git clone -b "$REPO_BRANCH" "$REPO_URL" "$source_repo"; then
+      error "克隆仓库失败。"
       return 1
     fi
-    work_dir="${REPO_INSTALL_DIR}"
+    work_dir="$source_repo"
   fi
-
-  # 推断 nx 可执行文件的安装目标：
-  # 1) 若 command -v nx 能找到，使用它的实际路径
-  # 2) 否则 fallback 到 /usr/local/bin/nx
-  local target_bin=""
-  if check_cmd nx; then
-    target_bin="$(command -v nx 2>/dev/null || true)"
-  fi
-  [[ -z "$target_bin" ]] && target_bin="/usr/local/bin/nx"
 
   # 对比更新前后内容：无变化则提示已最新并返回菜单，不重启
   local bin_md5_before=""
@@ -3246,6 +3267,7 @@ main_menu() {
 }
 
 main() {
+  ensure_runtime_dependencies || return 1
   ensure_dirs
   ensure_websocket_map
 
