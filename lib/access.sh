@@ -230,47 +230,48 @@ domain_only_rebuild_if_enabled() { domain_only_sync; }
 domain_only_after_apply() { :; }
 
 nx_site_access_menu() {
-  local file="$1" c
+  local file="$1" c policy
   [[ -f "$file" ]] || file="$CONF_DIR/$file"
-  echo "站点: $(basename "$file")；有效策略: $(nx_access_site_policy "$file")"
-  echo '1) 继承全局  2) 严格 Host / SNI  3) 开放（仍按 Nginx server_name 路由）  0) 返回'
+  policy="$(nx_access_site_policy "$file")" || return 1
+  echo "站点: $(basename "$file")"
+  if [[ "$policy" == strict ]]; then echo '仅域名访问：已开启'; else echo '仅域名访问：已关闭'; fi
+  echo '1) 开启仅域名访问'
+  echo '2) 关闭仅域名访问'
+  echo '3) 管理本站默认访问入口'
+  echo '0) 返回'
+  echo '开启后只接受本站域名；关闭不会自动将 IP 请求分配给本站。'
   read -rp '请选择: ' c || return 1
-  case "$c" in 1) nx_access_set_policy "$file" inherit;; 2) nx_access_set_policy "$file" strict;; 3) nx_access_set_policy "$file" open;; 0) return 0;; *) return 1;; esac
+  case "$c" in
+    1) nx_access_set_policy "$file" strict ;;
+    2) nx_access_set_policy "$file" open ;;
+    3) nx_default_site_menu "$file" ;;
+    0) return 0 ;;
+    *) warn '无效输入。'; return 1 ;;
+  esac
 }
 
 nx_default_site_menu() {
-  local -a files=() sockets=()
-  local i choice file rows socket defaults
-  mapfile -t files < <(list_managed_conf_files 0)
-  for i in "${!files[@]}"; do echo "$((i+1))) $(basename "${files[$i]}")"; done
-  echo '0) 返回'
-  read -rp '默认站点编号: ' choice || return 1
-  [[ "$choice" == 0 ]] && return 0
-  [[ "$choice" =~ ^[1-9][0-9]*$ ]] && ((choice<=${#files[@]})) || return 1
-  file="${files[$((choice-1))]}"
+  local file="$1" i choice rows socket defaults
+  local -a sockets=()
+  [[ -f "$file" && "$file" == *.conf ]] || { error '请先启用本站配置。'; return 1; }
   rows="$(nx_access_parse "$file")" || return 1
   mapfile -t sockets < <(cut -d '|' -f2 <<< "$rows" | sort -u)
+  defaults="$(conf_meta_get "$file" access_default)"
+  echo "本站默认入口：${defaults:-未设置}"
   for i in "${!sockets[@]}"; do echo "$((i+1))) ${sockets[$i]}"; done
-  echo '0) 清除此站点的显式默认设置'
-  echo '默认站点会接收该监听地址上未匹配的请求；严格策略仍拒绝无效 Host / SNI。'
+  echo 'c) 清除本站默认入口设置'
+  echo '0) 返回'
+  echo '选择监听地址后，本站接收该地址的 IP / 未匹配域名请求；开启仅域名访问时仍会拒绝这些请求。'
+  echo '同一监听地址只能有一个默认站点；更换时请先在原站点清除设置。'
   read -rp '选择监听地址: ' choice || return 1
-  if [[ "$choice" == 0 ]]; then nx_access_set_default "$file" ''; return; fi
+  case "$choice" in
+    0) return 0 ;;
+    c|C) nx_access_set_default "$file" ''; return ;;
+  esac
   [[ "$choice" =~ ^[1-9][0-9]*$ ]] && ((choice<=${#sockets[@]})) || return 1
   socket="${sockets[$((choice-1))]}"
-  defaults="$(conf_meta_get "$file" access_default)"
   if [[ ",$defaults," != *",$socket,"* ]]; then defaults="${defaults:+$defaults,}$socket"; fi
   nx_access_set_default "$file" "$defaults"
-}
-
-domain_only_menu() {
-  local c
-  while true; do
-    echo '访问策略：全局规则适用于选择“继承”的站点；每个站点可单独覆盖。'
-    if domain_only_state_is_enabled; then echo '全局：严格'; else echo '全局：开放'; fi
-    echo '1) 全局严格  2) 全局开放  3) 设置默认站点  0) 返回'
-    read -rp '请选择: ' c || return 1
-    case "$c" in 1) run_menu_action domain_only_enable; pause;; 2) run_menu_action domain_only_disable; pause;; 3) run_menu_action nx_default_site_menu; pause;; 0) return 0;; *) warn '无效输入。';; esac
-  done
 }
 
 # Compatibility for the diagnostics page: ports only, parsed from exact sockets.

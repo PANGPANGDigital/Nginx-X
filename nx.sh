@@ -1461,10 +1461,10 @@ print_conf_list() {
     policy="$(conf_meta_get "$CONF_DIR/$f" access_policy)"
     case "$policy" in
       ''|inherit)
-        effective="开放"; domain_only_state_is_enabled && effective="严格"
-        policy="继承全局（${effective}）" ;;
-      strict) policy="仅本站域名" ;;
-      open) policy="开放" ;;
+        effective="关闭"; domain_only_state_is_enabled && effective="开启"
+        policy="仅域名访问：${effective}（沿用原设置）" ;;
+      strict) policy="仅域名访问：开启" ;;
+      open) policy="仅域名访问：关闭" ;;
       *) policy="无效策略" ;;
     esac
     status="已停用"; [[ "$f" == *.conf ]] && status="已启用"
@@ -1785,7 +1785,7 @@ config_file_action_menu() {
     echo "3) 修改"
     echo "4) 编辑"
     echo "5) 删除"
-    echo "6) 域名访问限制（继承全局 / 严格域名）"
+    echo "6) 仅域名访问"
     echo "7) HTTPS 开关"
     echo "8) 站点健康检查"
     echo "0) 返回上一级"
@@ -2193,7 +2193,6 @@ config_entry_menu() {
     echo "3) 配置列表"
     echo "4) 导入已有配置"
     echo "5) 系统DNS设置"
-    echo "6) 域名访问限制"
     echo "0) 返回上一级"
     echo "=============================="
     read -rp "请选择: " c
@@ -2204,9 +2203,8 @@ config_entry_menu() {
       3) config_manage_menu ;;
       4) run_menu_action import_existing_confs; pause ;;
       5) dns_setup_menu ;;
-      6) domain_only_menu ;;
       0) return 0 ;;
-      *) warn "无效输入。请输入 0-6 之间的菜单编号。"; pause ;;
+      *) warn "无效输入。请输入 0-5 之间的菜单编号。"; pause ;;
     esac
   done
 }
@@ -2685,7 +2683,7 @@ cert_menu() {
       5) cert_list_menu ;;
       6) run_menu_action enable_https_for_domain; pause ;;
       0) return 0 ;;
-      *) warn "无效输入。请输入 0-6 之间的菜单编号。"; pause ;;
+      *) warn "无效输入。请输入 0-5 之间的菜单编号。"; pause ;;
     esac
   done
 }
