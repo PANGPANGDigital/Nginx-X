@@ -32,7 +32,7 @@ DNS_CONF="${STATE_DIR}/dns.conf"
 DOMAIN_ONLY_STATE="${STATE_DIR}/domain-only.conf"
 REPO_URL="https://github.com/Xiuyixx/Nginx-X.git"
 REPO_BRANCH="main"
-REPO_INSTALL_DIR="/opt/Nginx-X"
+REPO_INSTALL_DIR="${REPO_INSTALL_DIR:-/opt/Nginx-X}"
 
 SUDO=""
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -3257,6 +3257,29 @@ main() {
 }
 
 # All modules load before an update can change the repository on disk.
+# Pre-module releases copied only nx.sh to the installed executable. Recover
+# from that exact legacy update using the matching, already-pulled repository.
+# Never source modules of a different revision or download code during recovery.
+if [[ ! -r "${NX_LIB_DIR:-${SCRIPT_DIR}/lib}/transactions.sh" ]]; then
+  nx_legacy_source="${BASH_SOURCE[0]}"
+  if [[ -r "${REPO_INSTALL_DIR}/tools/build-bundle.sh" &&
+        -r "${REPO_INSTALL_DIR}/install.sh" &&
+        -f "${REPO_INSTALL_DIR}/nx.sh" ]] &&
+      cmp -s "$nx_legacy_source" "${REPO_INSTALL_DIR}/nx.sh"; then
+    if ${SUDO} env TARGET_BIN="$nx_legacy_source" INSTALL_DIR="$REPO_INSTALL_DIR" \
+        bash "${REPO_INSTALL_DIR}/install.sh" --no-run; then
+      if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+        exec bash "$nx_legacy_source" "$@"
+      else
+        # shellcheck disable=SC1090
+        source "$nx_legacy_source"
+        return $?
+      fi
+    fi
+    error "旧版更新迁移失败，请从仓库重新运行 install.sh。"
+    if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then exit 1; else return 1; fi
+  fi
+fi
 NX_LIB_DIR="${NX_LIB_DIR:-${SCRIPT_DIR}/lib}"
 for nx_module in templates certificates transactions access https; do
   if [[ ! -r "${NX_LIB_DIR}/${nx_module}.sh" ]]; then

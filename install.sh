@@ -131,7 +131,7 @@ bootstrap_install() {
     fi
   fi
 
-  if ! ${SUDO} env NO_RUN=1 bash "$INSTALL_DIR/install.sh" --no-run; then
+  if ! ${SUDO} env NO_RUN=1 TARGET_BIN="$TARGET_BIN" INSTALL_DIR="$INSTALL_DIR" bash "$INSTALL_DIR/install.sh" --no-run; then
     echo "[ERROR] 安装器执行失败。"
     exit 1
   fi
