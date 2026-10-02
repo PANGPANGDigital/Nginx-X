@@ -41,7 +41,13 @@ source "$REPO_DIR/nx.sh"
 SUDO=""
 mkdir -p "$CONF_DIR" "$STATE_DIR" "$SSL_DIR" "$TEST_ROOT/www/.well-known/acme-challenge"
 printf 'renewal-proof\n' > "$TEST_ROOT/www/.well-known/acme-challenge/token"
-nginx_supports_ssl_reject_handshake() { return 0; }
+# Keep the production capability gate, using the binary running this fixture.
+nginx_local_version() {
+  "$NGINX_BIN" -v 2>&1 | sed -E 's#^nginx version: nginx/##'
+}
+TLS_DENIED=CLOSED
+if nginx_supports_ssl_reject_handshake; then TLS_DENIED=HANDSHAKE_REJECTED; fi
+echo "Testing nginx $(nginx_local_version): TLS catchall expects $TLS_DENIED"
 domain_only_warn_exposed_ports() { :; }
 # Allocate distinct unprivileged loopback ports, retaining reservations until all
 # choices have been made. The brief close/bind race is limited to this instance.
@@ -126,6 +132,15 @@ else: raise SystemExit('reload did not produce a new worker')
 PY
 }
 nx_access_sync_files
+if [[ "$TLS_DENIED" == HANDSHAKE_REJECTED ]]; then
+  grep -q 'ssl_reject_handshake on;' "$(domain_only_conf_path)"
+else
+  if grep -q 'ssl_reject_handshake' "$(domain_only_conf_path)"; then
+    echo 'FAIL: unsupported handshake directive in legacy catchall' >&2; exit 1
+  fi
+  grep -q 'return 444;' "$(domain_only_conf_path)"
+  grep -q 'ssl_certificate ' "$(domain_only_conf_path)"
+fi
 "$NGINX_BIN" -p "$TEST_ROOT/" -c "$NGINX_MAIN_CONF" -t
 "$NGINX_BIN" -p "$TEST_ROOT/" -c "$NGINX_MAIN_CONF"
 # Each assertion opens a fresh connection. Refused connections/timeouts are test
@@ -155,7 +170,7 @@ if not handshake_rejected:
             if not chunk: break
             response+=chunk
 status=response.split(b' ',2)[1].decode() if response.startswith(b'HTTP/') else 'CLOSED'
-if handshake_rejected: status='CLOSED'
+if handshake_rejected: status='HANDSHAKE_REJECTED'
 assert status==expected, f'{label}: expected {expected}, got {status}: {response!r}'
 if body!='-': assert body.encode() in response.split(b'\r\n\r\n',1)[-1], (label,response)
 print('PASS:',label)
@@ -172,8 +187,8 @@ http 'HTTP uppercase and port' "ALPHA.TEST:$HTTP_PORT" 200 alpha
 http 'HTTP trailing dot normalized' alpha.test. 200 alpha
 http 'shared socket second site' beta.test 200 beta
 tls 'valid SNI and Host' alpha.test alpha.test 200 alpha
-tls 'absent SNI' NONE alpha.test CLOSED
-tls 'unknown SNI' unknown.test alpha.test CLOSED
+tls 'absent SNI' NONE alpha.test "$TLS_DENIED"
+tls 'unknown SNI' unknown.test alpha.test "$TLS_DENIED"
 tls 'mismatching SNI and Host' beta.test alpha.test CLOSED
 tls 'SNI alias matching Host' www.alpha.test www.alpha.test 200 alpha
 tls 'SNI alias mismatching Host' www.alpha.test alpha.test CLOSED

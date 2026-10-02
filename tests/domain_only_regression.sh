@@ -3,6 +3,17 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source ./nx.sh
+# ssl_reject_handshake first appeared in 1.19.4. Keep boundary mocks local
+# to a subshell so later checks use the actual installed version.
+(
+ nginx_local_version() { echo "$gate_version"; }
+ for gate_version in '' 1.18.0 '1.18.0 (Ubuntu)' 1.19.3 '1.19.3 (Ubuntu)'; do
+  if nginx_supports_ssl_reject_handshake; then exit 1; fi
+ done
+ for gate_version in 1.19.4 '1.19.4 (Ubuntu)' 1.20.0 1.22.1; do
+  nginx_supports_ssl_reject_handshake
+ done
+)
 root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
 CONF_DIR="$root/conf"; STATE_DIR="$root/state"; DOMAIN_ONLY_STATE="$STATE_DIR/domain-only.conf"

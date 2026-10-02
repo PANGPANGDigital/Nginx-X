@@ -2643,7 +2643,10 @@ nginx_supports_ssl_reject_handshake() {
   if [[ -z "$v" ]]; then
     return 1
   fi
-  version_gt "$v" "1.19.3"
+  # Distribution builds append a label (for example "1.18.0 (Ubuntu)").
+  # Compare the numeric version against the first release with this directive.
+  v="${v%% *}"
+  ! version_gt "1.19.4" "$v"
 }
 
 domain_only_list_exposed_ports() {

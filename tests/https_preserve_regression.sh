@@ -226,7 +226,9 @@ server {
  location /custom { return 200 'custom'; }
 }
 SITE
-nginx_local_version() { echo 1.22.1; }
+nginx_local_version() {
+  "$NGINX_TEST_BIN" -v 2>&1 | sed -E 's#^nginx version: nginx/##'
+}
 reload_nginx_safe() {
   sed "s@include .*;@include $CONF_DIR/*.conf;@" "$TEST_ROOT/nginx.conf" > "$TEST_ROOT/integrated-nginx.conf"
   "${nginx_test_command[@]}" -t -p "$TEST_ROOT" -c "$TEST_ROOT/integrated-nginx.conf" > "$TEST_ROOT/nginx-test.log" 2>&1 || { cat "$TEST_ROOT/nginx-test.log" >&2; return 1; }

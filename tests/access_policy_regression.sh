@@ -7,7 +7,12 @@ root=$(mktemp -d)
 trap '[[ ! -f "$root/nginx.pid" ]] || kill "$(cat "$root/nginx.pid")" 2>/dev/null || :; rm -rf "$root"' EXIT
 CONF_DIR="$root/conf"; DOMAIN_ONLY_STATE="$root/state"; SUDO=''
 mkdir -p "$CONF_DIR"
-nginx_local_version() { echo 1.22.1; }
+nginx_bin=${NGINX_TEST_BIN:-$(command -v nginx || true)}
+# Detect capabilities from the same binary used for real validation below.
+nginx_local_version() {
+ [[ -x "$nginx_bin" ]] || return 0
+ "$nginx_bin" -v 2>&1 | sed -E 's#^nginx version: nginx/##'
+}
 cat > "$CONF_DIR/site.conf" <<'EOF'
 # managed_by=Nginx-X
 server {
@@ -54,7 +59,6 @@ if nx_access_sync_files > /dev/null 2>&1; then exit 1; fi
 rm "$CONF_DIR/custom.conf"
 nx_access_set_default_files "$CONF_DIR/site.conf" ''
 nx_access_sync_files
-nginx_bin=${NGINX_TEST_BIN:-$(command -v nginx || true)}
 if [[ -x "$nginx_bin" ]]; then
  openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=a.example -keyout "$root/key" -out "$root/cert" >/dev/null 2>&1
  cat >> "$CONF_DIR/site.conf" <<EOF
