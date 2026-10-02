@@ -96,14 +96,19 @@ EOF
 EOF
 }
 site alpha strict "127.0.0.1:$HTTP_PORT" > "$CONF_DIR/alpha.conf"
-site alpha strict "127.0.0.1:$TLS_PORT" 1 >> "$CONF_DIR/alpha.conf"
+site alpha strict "127.0.0.1:$TLS_PORT" 1 | sed '/^# managed_by=/d; /^# access_policy=/d' >> "$CONF_DIR/alpha.conf"
 site beta inherit "127.0.0.1:$HTTP_PORT" > "$CONF_DIR/beta.conf"
-site beta inherit "127.0.0.1:$TLS_PORT" 1 >> "$CONF_DIR/beta.conf"
+site beta inherit "127.0.0.1:$TLS_PORT" 1 | sed '/^# managed_by=/d; /^# access_policy=/d' >> "$CONF_DIR/beta.conf"
 site exact strict "127.0.0.2:$EXACT_PORT" > "$CONF_DIR/exact.conf"
 if (( HAS_IPV6 )); then site six strict "[::1]:$V6_PORT" > "$CONF_DIR/six.conf"; fi
 # A new worker PID proves the asynchronous reload has actually been applied.
 reload_nginx_safe() {
-  "$NGINX_BIN" -p "$TEST_ROOT/" -c "$NGINX_MAIN_CONF" -t > "$TEST_ROOT/validation.log" 2>&1 || return 1
+  if ! "$NGINX_BIN" -p "$TEST_ROOT/" -c "$NGINX_MAIN_CONF" -t > "$TEST_ROOT/validation.log" 2>&1; then
+    if grep -q 'unknown directive "invalid_directive"' "$TEST_ROOT/validation.log"; then
+      : > "$TEST_ROOT/invalid-directive-rejected"
+    fi
+    return 1
+  fi
   if [[ "${FAIL_RELOAD_ONCE:-0}" == 1 ]]; then FAIL_RELOAD_ONCE=0; return 1; fi
   local before
   before="$(cat "/proc/$(cat "$TEST_ROOT/nginx.pid")/task/$(cat "$TEST_ROOT/nginx.pid")/children")"
@@ -204,8 +209,9 @@ tls 'per-site strict survives global disable' alias.test alpha.test CLOSED
 # A failed real nginx validation must restore every file and global state.
 cp -a "$CONF_DIR" "$TEST_ROOT/before-conf"
 cp -a "$DOMAIN_ONLY_STATE" "$TEST_ROOT/before-state"
-invalid_mutation() { printf '\ninvalid_directive;\n' >> "$CONF_DIR/beta.conf"; }
+invalid_mutation() { sed -i '/^server {/a\  invalid_directive;' "$CONF_DIR/beta.conf"; }
 if nx_transaction invalid_mutation; then echo 'FAIL: invalid nginx config accepted' >&2; exit 1; fi
+[[ -f "$TEST_ROOT/invalid-directive-rejected" ]]
 diff -r "$TEST_ROOT/before-conf" "$CONF_DIR"
 cmp "$TEST_ROOT/before-state" "$DOMAIN_ONLY_STATE"
 http 'validation rollback preserves live default' unknown.test 200 beta

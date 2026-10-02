@@ -1450,14 +1450,25 @@ print_conf_list() {
   fi
 
   echo "可管理配置列表："
-  local f domain ports tls policy status
+  local f domain ports tls policy status rows effective
   for f in "${FILES[@]}"; do
     domain="$(extract_domain_from_conf "$CONF_DIR/$f")"
-    ports="$(sed -nE 's/^[[:space:]]*listen[[:space:]]+([^ ;]+).*$/\1/p' "$CONF_DIR/$f" | sort -u | tr '\n' ',')"
+    ports="未知监听"
+    if rows="$(nx_access_parse "$CONF_DIR/$f" 2>/dev/null)" && [[ -n "$rows" ]]; then
+      ports="$(cut -d '|' -f2 <<< "$rows" | sort -u | paste -sd ',' -)"
+    fi
     tls="HTTP"; conf_https_enabled "$CONF_DIR/$f" && tls="HTTPS"
-    policy="$(conf_meta_get "$CONF_DIR/$f" access_policy)"; policy="${policy:-inherit}"
+    policy="$(conf_meta_get "$CONF_DIR/$f" access_policy)"
+    case "$policy" in
+      ''|inherit)
+        effective="开放"; domain_only_state_is_enabled && effective="严格"
+        policy="继承全局（${effective}）" ;;
+      strict) policy="仅本站域名" ;;
+      open) policy="开放" ;;
+      *) policy="无效策略" ;;
+    esac
     status="已停用"; [[ "$f" == *.conf ]] && status="已启用"
-    echo "  ${i}) ${domain:-未知域名} | ${ports%,} | ${tls} | ${policy} | ${status} | ${f}"
+    echo "  ${i}) ${domain:-未知域名} | ${ports} | ${tls} | ${policy} | ${status} | ${f}"
     ((i+=1))
   done
   return 0
