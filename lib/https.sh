@@ -11,7 +11,7 @@ import sys
 import subprocess
 import os
 
-operation, filename, domain, ssl_dir, requested = sys.argv[1:]
+operation, filename, domain, ssl_dir, requested, *preserve_sources = sys.argv[1:]
 
 def fail(message):
     raise ValueError(message)
@@ -28,94 +28,98 @@ try:
     # Access guards are derived from metadata and regenerated in the transaction.
     text = re.sub(r"(?m)^\s*# nx-access-begin\n.*?^\s*# nx-access-end\n", "\n", text, flags=re.S | re.M)
     text = re.sub(r" default_server # nx-access-default\n", "", text)
-    # Quotes, comments, escaped characters, and ${variables} cannot alter nesting.
-    tokens = []
-    metadata = {}
-    depth = 0
-    i = 0
-    while i < len(text):
-        if text[i].isspace():
-            i += 1
-            continue
-        if text[i] == '#':
-            end = text.find('\n', i)
-            end = len(text) if end < 0 else end + 1
-            line_start = text.rfind('\n', 0, i) + 1
-            # Setters append metadata after server blocks. Only standalone
-            # top-level comments count, never strings or comments in a block.
-            if depth == 0 and not text[line_start:i].strip():
-                match = re.fullmatch(r'# ([A-Za-z_][A-Za-z_0-9]*)=([^\r\n]*)(?:\r?\n)?', text[i:end])
-                if match:
-                    metadata.setdefault(match[1], []).append((line_start, end, match[2]))
-            i = end
-            continue
-        start = i
-        if text[i] in '{};':
-            if text[i] == '{':
-                depth += 1
-            elif text[i] == '}':
-                depth -= 1
-            i += 1
-        else:
-            quote = None
-            while i < len(text):
-                c = text[i]
-                if c == '\\':
-                    i += 2
-                    continue
-                if quote:
-                    if c == quote:
-                        quote = None
-                    i += 1
-                    continue
-                if c in '\"\'':
-                    quote = c
-                    i += 1
-                    continue
-                if text.startswith('${', i):
-                    end = text.find('}', i + 2)
-                    if end < 0:
-                        fail('unterminated variable')
-                    i = end + 1
-                    continue
-                if c.isspace() or c in '{};#':
-                    break
+    def parse_text(text):
+        # Quotes, comments, escaped characters, and ${variables} cannot alter nesting.
+        tokens = []
+        metadata = {}
+        depth = 0
+        i = 0
+        while i < len(text):
+            if text[i].isspace():
                 i += 1
-            if quote or i > len(text):
-                fail('unterminated quote/escape')
-        tokens.append((text[start:i], start, i))
+                continue
+            if text[i] == '#':
+                end = text.find('\n', i)
+                end = len(text) if end < 0 else end + 1
+                line_start = text.rfind('\n', 0, i) + 1
+                # Setters append metadata after server blocks. Only standalone
+                # top-level comments count, never strings or comments in a block.
+                if depth == 0 and not text[line_start:i].strip():
+                    match = re.fullmatch(r'# ([A-Za-z_][A-Za-z_0-9]*)=([^\r\n]*)(?:\r?\n)?', text[i:end])
+                    if match:
+                        metadata.setdefault(match[1], []).append((line_start, end, match[2]))
+                i = end
+                continue
+            start = i
+            if text[i] in '{};':
+                if text[i] == '{':
+                    depth += 1
+                elif text[i] == '}':
+                    depth -= 1
+                i += 1
+            else:
+                quote = None
+                while i < len(text):
+                    c = text[i]
+                    if c == '\\':
+                        i += 2
+                        continue
+                    if quote:
+                        if c == quote:
+                            quote = None
+                        i += 1
+                        continue
+                    if c in '\"\'':
+                        quote = c
+                        i += 1
+                        continue
+                    if text.startswith('${', i):
+                        end = text.find('}', i + 2)
+                        if end < 0:
+                            fail('unterminated variable')
+                        i = end + 1
+                        continue
+                    if c.isspace() or c in '{};#':
+                        break
+                    i += 1
+                if quote or i > len(text):
+                    fail('unterminated quote/escape')
+            tokens.append((text[start:i], start, i))
 
-    cursor = 0
-    def parse(nested=False):
-        global cursor
-        nodes = []
-        while cursor < len(tokens):
-            if tokens[cursor][0] == '}':
-                if not nested:
-                    fail('unexpected closing brace')
-                closing = tokens[cursor][2]
+        cursor = 0
+        def parse(nested=False):
+            nonlocal cursor
+            nodes = []
+            while cursor < len(tokens):
+                if tokens[cursor][0] == '}':
+                    if not nested:
+                        fail('unexpected closing brace')
+                    closing = tokens[cursor][2]
+                    cursor += 1
+                    return nodes, closing
+                args = []
+                start = tokens[cursor][1]
+                while cursor < len(tokens) and tokens[cursor][0] not in '{};':
+                    args.append(tokens[cursor][0])
+                    cursor += 1
+                if not args or cursor >= len(tokens):
+                    fail('incomplete directive')
+                delimiter, opening, end = tokens[cursor]
                 cursor += 1
-                return nodes, closing
-            args = []
-            start = tokens[cursor][1]
-            while cursor < len(tokens) and tokens[cursor][0] not in '{};':
-                args.append(tokens[cursor][0])
-                cursor += 1
-            if not args or cursor >= len(tokens):
-                fail('incomplete directive')
-            delimiter, opening, end = tokens[cursor]
-            cursor += 1
-            children = None
-            if delimiter == '{':
-                children, end = parse(True)
-            elif delimiter != ';':
-                fail('missing semicolon')
-            nodes.append(dict(args=args, start=start, end=end, opening=opening, children=children))
-        if nested:
-            fail('unclosed block')
-        return nodes, len(text)
+                children = None
+                if delimiter == '{':
+                    children, end = parse(True)
+                elif delimiter != ';':
+                    fail('missing semicolon')
+                nodes.append(dict(args=args, start=start, end=end, opening=opening, children=children))
+            if nested:
+                fail('unclosed block')
+            return nodes, len(text)
 
-    nodes, _ = parse()
+        nodes, _ = parse()
+        return nodes, metadata
+
+    nodes, metadata = parse_text(text)
     servers = [n for n in nodes if n['args'] == ['server'] and n['children'] is not None]
     if not servers or any(n['args'][0] == 'include' for n in nodes):
         fail('expected explicit server blocks without top-level includes')
@@ -163,6 +167,34 @@ try:
                 return False
         return all(listener(n)[1] == '80' and 'ssl' not in listener(n)[2] for n in directives(node, 'listen'))
 
+    preserved = {}
+    if preserve_sources:
+        if operation != 'enable' or len(preserve_sources) != 1:
+            fail('invalid TLS preservation request')
+        old_text = open(preserve_sources[0], encoding='utf-8').read()
+        old_nodes, _ = parse_text(old_text)
+        old_apps = [n for n in old_nodes if n['args'] == ['server'] and n['children'] is not None
+                    and any('ssl' in x['args'][2:] for x in directives(n, 'listen'))]
+        if len(old_apps) != 1 or domain not in names(old_apps[0]):
+            fail('expected one explicit original TLS application server')
+        old_app = old_apps[0]
+        if any(n['args'][0] == 'include' for n in walk(old_app)):
+            fail('cannot preserve TLS hidden by includes')
+        for key in ('ssl_certificate', 'ssl_certificate_key', 'ssl_protocols'):
+            found = directives(old_app, key)
+            if not found and key == 'ssl_protocols':
+                continue
+            if len(found) != 1 or found[0]['children'] is not None:
+                fail('expected one original ' + key)
+            preserved[key] = found[0]
+        # The very certificate we will publish must cover all candidate aliases.
+        cert_token = preserved['ssl_certificate']['args'][1:]
+        if len(cert_token) != 1:
+            fail('ambiguous original certificate path')
+        preserved_cert = cert_token[0].strip("\"'")
+        if not os.path.isabs(preserved_cert) or '$' in preserved_cert or '\\' in preserved_cert:
+            fail('unsupported original certificate path')
+
     if operation in ('challenge', 'challenge-probe'):
         selected = []
         for server in servers:
@@ -176,6 +208,8 @@ try:
             sys.exit(0)
         edits = []
         for server in selected:
+            if any(n['args'][0] in ('rewrite', 'if') for n in server['children']):
+                fail('server-level rewrite/if precedes HTTP-01; adjust routing manually')
             if any(n['args'][0] == 'include' for n in server['children']):
                 fail('cannot safely modify challenge routing hidden by server includes')
             returns = directives(server, 'return')
@@ -283,7 +317,7 @@ try:
     if operation == 'enable':
         # Refuse aliases not covered by the selected certificate; never silently
         # drop names or request additional certificates on the user's behalf.
-        certfile = ssl_dir.rstrip('/') + '/' + domain + '/fullchain.pem'
+        certfile = preserved_cert if preserved else ssl_dir.rstrip('/') + '/' + domain + '/fullchain.pem'
         for alias in aliases:
             if not re.fullmatch(r'[A-Za-z0-9.-]+', alias):
                 fail('certificate coverage cannot be established for server_name: ' + alias)
@@ -315,6 +349,8 @@ try:
         if re.search(r'[\s;{}\"\'\\$#]', certpath):
             fail('unsupported characters in certificate path')
         certs = '\n    ssl_certificate     ' + certpath + '/fullchain.pem;\n    ssl_certificate_key ' + certpath + '/privkey.pem;\n    ssl_protocols TLSv1.2 TLSv1.3;\n'
+        if preserved:
+            certs = '\n    ' + '\n    '.join(old_text[n['start']:n['end']] for n in preserved.values()) + '\n'
         edits.append((app['opening'] + 1, app['opening'] + 1, certs))
         # Retain exactly the existing listener families and bindings on redirect port 80.
         redirect_listens = []

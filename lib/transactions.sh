@@ -187,6 +187,7 @@ nx_assert_new_target() {
 # Render TLS before publication. Never activate a temporary plain-text version.
 nx_preserve_modify_tls() {
   local src="$1" candidate="$2" domain="$3" requested="$4" stage original old_domain
+  local -a preserve_source=()
   conf_https_enabled "$src" || return 0
   old_domain="$(extract_domain_from_conf "$src")" || return 1
   [[ "$domain" == "$old_domain" || -f "$SSL_DIR/$domain/fullchain.pem" && -f "$SSL_DIR/$domain/privkey.pem" ]] || {
@@ -196,20 +197,9 @@ nx_preserve_modify_tls() {
   [[ -n "$original" ]] || original="$(conf_meta_get "$src" listen_port)"
   [[ -n "$original" ]] || original=80
   stage="$(mktemp)" || return 1
-  if ! nx_https_transform enable "$candidate" "$domain" "$SSL_DIR" "$requested" > "$stage"; then rm -f "$stage"; return 1; fi
+  [[ "$domain" != "$old_domain" ]] || preserve_source=("$src")
+  if ! nx_https_transform enable "$candidate" "$domain" "$SSL_DIR" "$requested" "${preserve_source[@]}" > "$stage"; then rm -f "$stage"; return 1; fi
   nx_access_metadata "$stage" https_original_listen_port "$original" || { rm -f "$stage"; return 1; }
-  # Preserve custom certificate paths/options when the hostname is unchanged.
-  if [[ "$domain" == "$old_domain" ]]; then
-    python3 - "$src" "$stage" <<'PY'
-import re, sys
-old=open(sys.argv[1]).read(); new=open(sys.argv[2]).read()
-for key in ('ssl_certificate','ssl_certificate_key','ssl_protocols'):
-    pattern=r'(?m)^\s*'+key+r'\s+[^;]+;'
-    values=re.findall(pattern,old)
-    if len(values)==1: new=re.sub(pattern,lambda _:values[0],new)
-open(sys.argv[2],'w').write(new)
-PY
-  fi
   cat "$stage" > "$candidate" || { rm -f "$stage"; return 1; }
   rm -f "$stage"
 }

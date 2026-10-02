@@ -132,3 +132,42 @@ lines=open(sys.argv[1]).read().splitlines()
 assert lines in (["first-start","first-end","second-start","second-end"], ["second-start","second-end","first-start","first-end"]), lines
 PY
 echo 'ok: concurrent transaction serialization'
+# Read-only queries retain hostname listeners and accept quoted token values.
+for listener in localhost:18080 '"18080"'; do
+  printf '# backend_port=3000\nserver { listen %s; server_name example.com; location / { proxy_pass "http://127.0.0.1:3000"; } }\n' "$listener" > "$T/inspect"
+  [[ "$(conf_meta_get "$T/inspect" backend_port)" == 3000 ]]
+  [[ "$(conf_server_block_count "$T/inspect")" == 1 ]]
+  [[ "$(extract_proxy_pass "$T/inspect")" == http://127.0.0.1:3000 ]]
+  [[ "$(nx_conf_query summary "$T/inspect")" == 'example.com|18080|http://127.0.0.1:3000|false|' ]]
+  printf 'pid %s/inspect.pid; error_log stderr; events {} http { access_log off; client_body_temp_path body; proxy_temp_path proxy; fastcgi_temp_path fastcgi; uwsgi_temp_path uwsgi; scgi_temp_path scgi; include %s/inspect; }\n' "$T" "$T" > "$T/inspect-main"
+  "$NGINX_TEST_BIN" -t -p "$T" -c "$T/inspect-main" > "$T/inspect.log" 2>&1 || { cat "$T/inspect.log"; exit 1; }
+  nx_conf_query keys "$T/inspect" > "$T/keys"
+  if [[ "$listener" == localhost:* ]]; then
+    grep -qx 'example.com|localhost:18080' "$T/keys"
+    if nx_access_parse "$T/inspect" >/dev/null 2>&1; then exit 1; fi
+    if nx_conf_query defaults "$T/inspect" localhost:18080 '' '' >/dev/null 2>&1; then exit 1; fi
+  else
+    grep -qx 'example.com|0.0.0.0:18080' "$T/keys"
+  fi
+done
+# Same-domain TLS modifications validate and preserve the actual custom cert,
+# including compact directives and quoted paths, without managed certificates.
+mkdir -p "$T/custom cert"
+cp "$SSL_DIR/example.com/"*.pem "$T/custom cert/"
+rm "$SSL_DIR/example.com/"*.pem
+printf 'server { listen 18443 ssl; server_name example.com; ssl_certificate "%s/custom cert/fullchain.pem"; ssl_certificate_key "%s/custom cert/privkey.pem"; ssl_protocols TLSv1.2; location / { proxy_pass http://127.0.0.1:3000; } }\n' "$T" "$T" > "$T/custom-old"
+build_proxy_conf example.com 18444 3001 "$T/custom-new"
+nx_preserve_modify_tls "$T/custom-old" "$T/custom-new" example.com 18444
+grep -Fq "ssl_certificate \"$T/custom cert/fullchain.pem\";" "$T/custom-new"
+grep -Fq "ssl_certificate_key \"$T/custom cert/privkey.pem\";" "$T/custom-new"
+grep -Fq 'ssl_protocols TLSv1.2;' "$T/custom-new"
+# shellcheck disable=SC2016
+printf 'pid %s/custom.pid; error_log stderr; events {} http { access_log off; client_body_temp_path body; proxy_temp_path proxy; fastcgi_temp_path fastcgi; uwsgi_temp_path uwsgi; scgi_temp_path scgi; map $http_upgrade $connection_upgrade { default upgrade; } include %s/custom-new; }\n' "$T" "$T" > "$T/custom-main"
+"$NGINX_TEST_BIN" -t -p "$T" -c "$T/custom-main" > "$T/custom.log" 2>&1 || { cat "$T/custom.log"; exit 1; }
+build_proxy_conf example.com 18444 3001 "$T/custom-uncovered"
+sed -i 's/server_name example.com;/server_name example.com uncovered.example;/' "$T/custom-uncovered"
+cp "$T/custom-uncovered" "$T/custom-before"
+if nx_preserve_modify_tls "$T/custom-old" "$T/custom-uncovered" example.com 18444 2> "$T/refusal"; then exit 1; fi
+grep -q 'does not cover server_name uncovered.example' "$T/refusal"
+cmp "$T/custom-before" "$T/custom-uncovered"
+echo 'ok: hostname/quoted inspection and compact custom TLS preservation with alias validation'

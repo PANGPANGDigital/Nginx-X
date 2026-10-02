@@ -273,3 +273,21 @@ if nx_https_transform enable "$TEST_ROOT/uncovered.conf" example.com "$SSL_DIR" 
 fi
 grep -q 'does not cover server_name uncovered.example.com' "$TEST_ROOT/refusal"
 [[ "$apply_count" == "$before_count" ]]
+# Server rewrite phase runs before ACME location selection. Refuse such valid
+# configs through the actual challenge helper before any publication.
+CONF_DIR="$TEST_ROOT/challenge-conf"
+mkdir -p "$CONF_DIR"
+apply_conf_with_rollback() { apply_count=$((apply_count + 1)); return 1; }
+# shellcheck disable=SC2016
+for routing in 'rewrite ^ /blocked permanent;' 'if ($request_uri) { return 403; }'; do
+  printf 'server { listen 80; server_name example.com; %s location / { return 200 ok; } }\n' "$routing" > "$CONF_DIR/rewrite.conf"
+  # Prove these are real valid Nginx configs, not malformed parser fixtures.
+  reload_nginx_safe
+  cp "$CONF_DIR/rewrite.conf" "$TEST_ROOT/rewrite-before"
+  before_count="$apply_count"
+  if ensure_acme_location_for_domain_conf example.com 2> "$TEST_ROOT/rewrite-refusal"; then exit 1; fi
+  grep -q 'server-level rewrite/if precedes HTTP-01' "$TEST_ROOT/rewrite-refusal"
+  [[ "$apply_count" == "$before_count" ]]
+  cmp "$TEST_ROOT/rewrite-before" "$CONF_DIR/rewrite.conf"
+done
+echo 'ok: real Nginx server rewrite/if challenge refusal before publishing'

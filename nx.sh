@@ -911,12 +911,17 @@ nx_conf_query() {
 import sys, re, ipaddress
 operation, filename, *params = sys.argv[1:]
 def fail(message): raise ValueError(message)
-def socket(value):
-    if value.isdigit(): return '0.0.0.0:' + str(int(value))
+def socket(value, inspect=False):
+    if value.isdigit(): value = '0.0.0.0:' + value
     host, number = value.rsplit(':', 1)
     host = host.strip('[]')
-    host = '0.0.0.0' if host == '*' else str(ipaddress.ip_address(host))
-    if not 1 <= int(number) <= 65535: fail('invalid port')
+    try:
+        host = '0.0.0.0' if host == '*' else str(ipaddress.ip_address(host))
+    except ValueError:
+        if not inspect or not re.fullmatch(r'[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.?', host):
+            fail('unsupported exact listen address: ' + value)
+        host = host.lower().rstrip('.')
+    if not number.isdigit() or not 1 <= int(number) <= 65535: fail('invalid port')
     return ('[' + host + ']' if ':' in host else host) + ':' + str(int(number))
 try:
     text = open(filename, encoding='utf-8').read()
@@ -1015,10 +1020,14 @@ try:
     def directives(n, key): return [x for x in n['children'] if x['args'][0] == key]
     def unquote(s): return s[1:-1] if len(s)>1 and s[0] == s[-1] and s[0] in '\"\'' else s
     rows = []
-    for idx, srv in enumerate(servers):
-        names = [unquote(x) for n in directives(srv, 'server_name') for x in n['args'][1:]]
-        for n in directives(srv, 'listen'):
-            rows.append((idx, socket(n['args'][1]), 'ssl' in n['args'][2:], names))
+    # Metadata and structural queries do not need resolvable listen sockets.
+    # Inspection retains hostnames; defaults/security operations require IPs.
+    if operation in ('keys', 'summary'):
+        for idx, srv in enumerate(servers):
+            names = [unquote(x) for n in directives(srv, 'server_name') for x in n['args'][1:]]
+            for n in directives(srv, 'listen'):
+                args = [unquote(x) for x in n['args'][1:]]
+                rows.append((idx, socket(args[0], inspect=True), 'ssl' in args[1:], names))
     if operation == 'meta':
         values = metadata.get(params[0], [])
         if len(values)>1: fail('duplicate metadata: '+params[0])
