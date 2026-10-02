@@ -10,7 +10,7 @@ SUDO=""
 mkdir -p "$CONF_DIR" "$SSL_DIR/example.com"
 NGINX_TEST_BIN="${NGINX_TEST_BIN:-/root/.openclaw/workspace/tmp/nginx-x-test-runtime/extracted/usr/sbin/nginx}"
 [[ -x "$NGINX_TEST_BIN" ]] || exit 1
-openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=example.com -keyout "$SSL_DIR/example.com/privkey.pem" -out "$SSL_DIR/example.com/fullchain.pem" >/dev/null 2>&1
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=example.com -addext subjectAltName=DNS:example.com,DNS:external.example -keyout "$SSL_DIR/example.com/privkey.pem" -out "$SSL_DIR/example.com/fullchain.pem" >/dev/null 2>&1
 cat > "$T/nginx.conf" <<NGINX
 pid $T/pid;
 error_log stderr;

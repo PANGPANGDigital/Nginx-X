@@ -266,7 +266,7 @@ echo 'ok: strict policy, explicit default, and HTTPS round trip'
 
 # Unsupported alias coverage must refuse before any apply, preserving aliases.
 cp "$conf" "$TEST_ROOT/uncovered.conf"
-sed -i 's/server_name example.com alias.example.com;/server_name example.com uncovered.example.com;/' "$TEST_ROOT/uncovered.conf"
+sed -i 's/server_name example.com;/server_name example.com uncovered.example.com;/' "$TEST_ROOT/uncovered.conf"
 before_count="$apply_count"
 if nx_https_transform enable "$TEST_ROOT/uncovered.conf" example.com "$SSL_DIR" 8443 > "$TEST_ROOT/refused" 2> "$TEST_ROOT/refusal"; then
   echo 'uncovered alias accepted' >&2; exit 1

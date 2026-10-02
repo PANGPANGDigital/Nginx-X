@@ -1,20 +1,30 @@
 #!/usr/bin/env bash
 # One mutation, derived access rules, config validation and reload form a unit.
 # Directory-wide snapshots retain modes/owners and include disabled sites.
+# Callback contract: disk mutations only; shell variables stay in this subshell.
+# Callers must use the return status (and files for instrumentation), not counters.
 nx_transaction() (
-  # The lock file lives outside the snapshotted directory. flock releases the
-  # advisory lock on exit, including signal rollback and unexpected termination.
+  # Lock the directory inode itself: no writable lock file, symlink race, or
+  # privileged shell redirection. Nginx configuration directories are readable
+  # by sudo users; every caller (including root) locks the same inode.
   local lock_fd
   [[ -n "$CONF_DIR" && "$CONF_DIR" != / && -d "$CONF_DIR" && ! -L "$CONF_DIR" ]] || { error "配置目录必须是明确的普通目录。"; return 1; }
   command -v flock >/dev/null 2>&1 || { error "事务需要 flock（util-linux）。"; return 1; }
-  exec {lock_fd}>"${CONF_DIR}.nx-lock" || return 1
+  exec {lock_fd}<"$CONF_DIR" || return 1
   flock -x "$lock_fd" || return 1
 
-  local snapshot rc=0 state_existed=0
+  local snapshot rc=0 state_existed=0 main_existed=0
+  # Read by ensure_websocket_map in nx.sh through Bash dynamic scope.
+  # shellcheck disable=SC2034
+  local NX_IN_TRANSACTION=1
   snapshot="$(mktemp -d /tmp/nginxx-transaction-XXXXXX)" || return 1
   if ! ${SUDO} cp -a "$CONF_DIR" "$snapshot/conf"; then
     rm -rf "$snapshot"
     return 1
+  fi
+  if [[ -f "$NGINX_MAIN_CONF" ]]; then
+    main_existed=1
+    ${SUDO} cp -a "$NGINX_MAIN_CONF" "$snapshot/main" || { ${SUDO} rm -rf "$snapshot"; return 1; }
   fi
   if [[ -f "$DOMAIN_ONLY_STATE" ]]; then
     state_existed=1
@@ -32,6 +42,9 @@ nx_transaction() (
       ${SUDO} rm -rf -- "$path" || rc=1
     done
     ${SUDO} cp -a "$snapshot/conf/." "$CONF_DIR/" || rc=1
+    if (( main_existed )); then
+      ${SUDO} cp -a "$snapshot/main" "$NGINX_MAIN_CONF" || rc=1
+    fi
     if (( state_existed )); then
       ${SUDO} cp -a "$snapshot/state" "$DOMAIN_ONLY_STATE" || rc=1
     else
@@ -47,7 +60,7 @@ nx_transaction() (
     fi
   }
   trap 'trap - HUP INT TERM; nx_transaction_restore; exit 1' HUP INT TERM
-  if "$@" && nx_access_sync_files && reload_nginx_safe; then
+  if "$@" && ensure_websocket_map && nx_access_sync_files && reload_nginx_safe; then
     trap - HUP INT TERM
     ${SUDO} rm -rf "$snapshot"
     return 0

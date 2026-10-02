@@ -412,19 +412,15 @@ ensure_acme_cron() {
   current="$(crontab -l 2>/dev/null || true)"
   # Rewrite only renewal commands belonging to this acme home. Keep their
   # arguments, environment and all unrelated cron jobs byte-for-byte.
-  updated="$(printf '%s\n' "$current" | awk -v home="$HOME/.acme.sh" '
-    /^[[:space:]]*#/ {print; next}
-    index($0,home "/acme.sh") && /--cron([[:space:]]|$)/ {
-      if ($1 !~ /^@/ && NF >= 6) {sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+/, "0 3 * * *"); found=1}
-      else if ($1 ~ /^@(monthly|yearly|annually|weekly|daily|hourly)$/) {sub(/@[^[:space:]]+/, "0 3 * * *"); found=1}
-    }
-    {print}
-    END {if (!found) print "0 3 * * * \"" home "/acme.sh\" --cron --home \"" home "\" >/dev/null"}
-  ')" || return 1
+  updated="$(printf '%s\n' "$current" | nx_acme_cron_filter daily)" || return 1
   if command -v crontab >/dev/null 2>&1; then
     printf '%s\n' "$updated" | crontab - || return 1
   elif [[ -d "$periodic" ]]; then
     script="$periodic/daily/acme-renew"
+    if [[ -e "$script" ]] && ! nx_acme_periodic_owned "$script"; then
+      error "每日任务路径属于其他账户，已保留：$script"; return 1
+    fi
+    [[ ${EUID:-$(id -u)} -eq 0 ]] || { error "系统 periodic 任务仅支持当前 root ACME 账户。"; return 1; }
     ${SUDO} mkdir -p "$periodic/daily" || return 1
     printf '#!/bin/sh\n"%s/.acme.sh/acme.sh" --cron --home "%s/.acme.sh" >/dev/null\n' "$HOME" "$HOME" | ${SUDO} tee "$script" >/dev/null || return 1
     ${SUDO} chmod 0755 "$script" || return 1
@@ -433,27 +429,121 @@ ensure_acme_cron() {
   fi
   # Remove only the legacy script generated for this same account.
   script="$periodic/monthly/acme-renew"
-  if [[ -f "$script" ]] && grep -Fq "$HOME/.acme.sh/acme.sh --cron --home $HOME/.acme.sh" "$script"; then
+  if nx_acme_periodic_owned "$script"; then
     ${SUDO} rm -f "$script" || return 1
   fi
   info "已配置每日 ACME 续期检查。"
 }
 
+# Parse shell words rather than matching substrings: acme.sh quotes its path,
+# sometimes as "/home/user/.acme.sh"/acme.sh. Never match another account.
+nx_acme_cron_filter() {
+  python3 -c '
+import sys, shlex, re
+home, mode = sys.argv[1:]
+found = False
+for line in sys.stdin.read().splitlines():
+    m = re.match(r"^(?:\s*@(?:monthly|yearly|annually|weekly|daily|hourly)|(?:\s*\S+){5})\s+(.+)$", line)
+    owned = False
+    if m and not line.lstrip().startswith("#"):
+        try:
+            words = shlex.split(m[1])
+            command = 0
+            while command < len(words) and re.match(r"^[A-Za-z_][A-Za-z_0-9]*=", words[command]):
+                command += 1
+            owned = command < len(words) and words[command] == home + "/acme.sh" and "--cron" in words[command+1:]
+            if any(word in (";", "&&", "||", "|", "&") for word in words):
+                owned = False
+            if "--home" in words:
+                i = words.index("--home")
+                owned = owned and i+1 < len(words) and words[i+1] == home
+        except ValueError:
+            pass
+    if owned:
+        if mode == "probe":
+            found = True
+        elif mode == "daily" and not found:
+            print("0 3 * * * " + m[1]); found = True
+    elif mode != "probe":
+        print(line)
+if mode == "probe":
+    sys.exit(0 if found else 1)
+if mode == "daily" and not found:
+    print("0 3 * * * " + shlex.quote(home + "/acme.sh") + " --cron --home " + shlex.quote(home) + " >/dev/null")
+' "$HOME/.acme.sh" "$1"
+}
+
+nx_acme_periodic_owned() {
+  [[ -f "$1" ]] || return 1
+  # Only the one-command legacy script belongs to us; never remove a mixed
+  # administrator script merely because one line invokes this acme account.
+  local body
+  body="$(sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d' "$1")" || return 1
+  [[ -n "$body" && "$body" != *$'\n'* ]] || return 1
+  printf '0 3 * * * %s\n' "$body" | nx_acme_cron_filter probe
+}
+
 has_acme_cron_task() {
-  crontab -l 2>/dev/null | grep -q 'acme.sh.*--cron' || \
-    [[ -f "${NX_PERIODIC_DIR:-/etc/periodic}/daily/acme-renew" || -f "${NX_PERIODIC_DIR:-/etc/periodic}/monthly/acme-renew" ]]
+  local script
+  if crontab -l 2>/dev/null | nx_acme_cron_filter probe; then return 0; fi
+  for script in "${NX_PERIODIC_DIR:-/etc/periodic}"/{daily,monthly}/acme-renew; do
+    nx_acme_periodic_owned "$script" && return 0
+  done
+  return 1
 }
 
 disable_acme_cron() {
-  local current
+  local current script
   current="$(crontab -l 2>/dev/null || true)"
-  printf '%s\n' "$current" | awk -v home="$HOME/.acme.sh/acme.sh" '!(index($0,home) && /--cron/ && $0 !~ /^[[:space:]]*#/)' | crontab - || return 1
-  local script
+  if command -v crontab >/dev/null 2>&1; then
+    printf '%s\n' "$current" | nx_acme_cron_filter remove | crontab - || return 1
+  fi
   for script in "${NX_PERIODIC_DIR:-/etc/periodic}"/{daily,monthly}/acme-renew; do
-    if [[ -f "$script" ]] && grep -Fq "$HOME/.acme.sh/acme.sh" "$script"; then
+    if nx_acme_periodic_owned "$script"; then
       ${SUDO} rm -f "$script" || return 1
     fi
   done
+}
+
+# Upgrade installed certificates belonging to this acme account without issuing
+# certificates or enabling a deliberately disabled renewal schedule.
+nx_migrate_certificate_renewal() {
+  [[ -x "$HOME/.acme.sh/acme.sh" ]] || return 0
+  local conf domain hook reloadcmd marker
+  hook="$(nx_install_acme_reload_hook)" || return 1
+  reloadcmd="'${hook//\'/\'\\\'\'}'"
+  for conf in "$HOME/.acme.sh"/*/*.conf; do
+    [[ -f "$conf" && ! -L "$conf" ]] || continue
+    domain="$(basename "$conf" .conf)"
+    valid_domain "$domain" || continue
+    [[ -s "$SSL_DIR/$domain/fullchain.pem" && -s "$SSL_DIR/$domain/privkey.pem" ]] || continue
+    # Read data without sourcing acme account files. Only migrate certificates
+    # already deployed to this manager’s exact destinations.
+    marker="$(python3 - "$conf" "$SSL_DIR/$domain" "$reloadcmd" <<'PYMIGRATE'
+import sys, shlex, base64
+values = {}
+for line in open(sys.argv[1]):
+    if "=" not in line: continue
+    key, value = line.rstrip("\n").split("=",1)
+    try:
+        parts = shlex.split(value)
+        if len(parts) == 1: values[key] = parts[0]
+    except ValueError: pass
+if values.get("Le_RealKeyPath") == sys.argv[2]+"/privkey.pem" and values.get("Le_RealFullChainPath") == sys.argv[2]+"/fullchain.pem":
+    hook = values.get("Le_ReloadCmd", "")
+    expected = sys.argv[3]
+    encoded = "__ACME_BASE64__START_" + base64.b64encode(expected.encode()).decode() + "__ACME_BASE64__END_"
+    print("done" if hook in (expected, encoded) else "migrate")
+PYMIGRATE
+)" || return 1
+    [[ "$marker" == migrate ]] || continue
+    local -a ecc=()
+    [[ "$(dirname "$conf")" != *_ecc ]] || ecc=(--ecc)
+    "$HOME/.acme.sh/acme.sh" --install-cert -d "$domain" "${ecc[@]}" \
+      --key-file "$SSL_DIR/$domain/privkey.pem" --fullchain-file "$SSL_DIR/$domain/fullchain.pem" \
+      --reloadcmd "$reloadcmd" || return 1
+  done
+  if has_acme_cron_task; then ensure_acme_cron || return 1; fi
 }
 
 enable_acme_cron() {

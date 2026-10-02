@@ -106,3 +106,48 @@ printf '#!/bin/sh\n%s/.acme.sh/acme.sh --cron --home %s/.acme.sh >/dev/null\n' "
 ensure_acme_cron
 [[ ! -f "$NX_PERIODIC_DIR/monthly/acme-renew" ]]
 echo 'certificate audit regressions passed' 
+# Quoted acme install cron syntax is recognized; duplicate same-account jobs
+# collapse while another home and comments remain byte-for-byte.
+printf '7 4 * * * unrelated\n0 3 1 */2 * "%s/.acme.sh"/acme.sh --cron --home "%s/.acme.sh" >/dev/null\n0 4 * * * "%s/.acme.sh/acme.sh" --cron --home "%s/.acme.sh"\n0 5 * * * /other/.acme.sh/acme.sh --cron --home /other/.acme.sh\n' "$HOME" "$HOME" "$HOME" "$HOME" > "$root/cron"
+ensure_acme_cron
+cp "$root/cron" "$root/cron-before"
+ensure_acme_cron
+cmp "$root/cron" "$root/cron-before"
+[[ "$(grep -c -- --cron "$root/cron")" == 2 ]]
+disable_acme_cron
+grep -q '^0 5 .* /other/' "$root/cron"
+if has_acme_cron_task; then exit 1; fi
+# Existing acme deploy destinations receive a persisted reload hook on startup;
+# unrelated destinations and certificates without an installed key are ignored.
+mkdir -p "$HOME/.acme.sh/example.com_ecc" "$HOME/.acme.sh/other.example"
+printf "Le_RealKeyPath='%s/example.com/privkey.pem'\nLe_RealFullChainPath='%s/example.com/fullchain.pem'\n" "$SSL_DIR" "$SSL_DIR" > "$HOME/.acme.sh/example.com_ecc/example.com.conf"
+printf "Le_RealKeyPath='/other/key.pem'\n" > "$HOME/.acme.sh/other.example/other.example.conf"
+: > "$ACME_LOG"
+nx_migrate_certificate_renewal
+grep -qx -- --ecc "$ACME_LOG"
+grep -qx -- --reloadcmd "$ACME_LOG"
+[[ "$(grep -c -- --install-cert "$ACME_LOG")" == 1 ]]
+# Simulate acme.sh persistence; a second startup performs no deployment.
+python3 - "$HOME/.acme.sh/example.com_ecc/example.com.conf" "$HOME/.acme.sh/nginxx-reload" <<'PY'
+import sys,base64
+cmd="'"+sys.argv[2]+"'"
+with open(sys.argv[1],'a') as f:
+    f.write("Le_ReloadCmd='__ACME_BASE64__START_"+base64.b64encode(cmd.encode()).decode()+"__ACME_BASE64__END_'\n")
+PY
+: > "$ACME_LOG"
+nx_migrate_certificate_renewal
+[[ ! -s "$ACME_LOG" ]]
+if has_acme_cron_task; then exit 1; fi
+echo 'ok: quoted cron identity, deduplication, removal, existing ECC migration and idempotence'
+# An arbitrary file at the helper name must never suppress the HTTP redirect.
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=example.com \
+  -keyout "$SSL_DIR/example.com/privkey.pem" -out "$SSL_DIR/example.com/fullchain.pem" >/dev/null 2>&1
+build_proxy_conf example.com 18080 3000 "$root/plain-site"
+printf 'server { listen 8080; server_name other.example; }\n' > "$CONF_DIR/acme-challenge-example.com.conf"
+if nx_https_transform enable "$root/plain-site" example.com "$SSL_DIR" 18443 > "$root/tls" 2> "$root/refusal"; then exit 1; fi
+grep -q 'existing ACME helper' "$root/refusal"
+rm "$CONF_DIR/acme-challenge-example.com.conf" "$CONF_DIR/site.conf"
+ensure_http_challenge_server example.com >/dev/null
+nx_https_transform enable "$root/plain-site" example.com "$SSL_DIR" 18443 > "$root/tls"
+[[ "$(grep -c '^server {' "$root/tls")" == 1 ]]
+echo 'ok: existing challenge helper identity is validated'

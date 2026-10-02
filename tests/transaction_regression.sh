@@ -101,3 +101,47 @@ fail_reload=0
 modify_conf modify.example-18080.conf.bak <<< $'\n\n\n' >/dev/null
 [[ -f "$CONF_DIR/modify.example-18080.conf.bak" && ! -e "$CONF_DIR/modify.example-18080.conf" ]]
 echo 'ok: interactive modify failure propagation and disabled status'
+# Builders only render. A missing WebSocket map is included in the same final
+# apply; map and site both disappear on failure, with one rollback reload.
+NGINX_MAIN_CONF="$T/nginx.conf"
+printf 'events {}\nhttp {\n include %s/*.conf; # conf.d\n}\n' "$CONF_DIR" > "$NGINX_MAIN_CONF"
+rm -f "$CONF_DIR/00-websocket-map.conf"
+before="$(cat "$T/reloads")"
+build_proxy_conf map.example 18099 3000 "$T/map-site"
+[[ ! -e "$CONF_DIR/00-websocket-map.conf" ]]
+[[ "$(cat "$T/reloads")" == "$before" ]]
+apply_conf_with_rollback "$T/map-site" "$CONF_DIR/map.conf"
+[[ -f "$CONF_DIR/00-websocket-map.conf" ]]
+[[ "$(cat "$T/reloads")" == "$((before+1))" ]]
+rm "$CONF_DIR/map.conf" "$CONF_DIR/00-websocket-map.conf"
+fail_reload=1
+if apply_conf_with_rollback "$T/map-site" "$CONF_DIR/map.conf"; then exit 1; fi
+[[ ! -e "$CONF_DIR/map.conf" && ! -e "$CONF_DIR/00-websocket-map.conf" ]]
+echo 'ok: render has no side effects, map and site share one transaction'
+# Directory locking works without permission to create an adjacent lock file.
+# The directory owner may mutate sites but cannot write the protected parent.
+if [[ $(id -u) == 0 ]] && command -v runuser >/dev/null 2>&1; then
+  mkdir "$T/protected"
+  chmod 755 "$T" "$T/protected"
+  mkdir "$T/protected/conf"
+  chown nobody "$T/protected/conf"
+  cat > "$T/lock-test" <<'LOCK'
+set -euo pipefail
+source "$1/nx.sh"
+CONF_DIR="$2/protected/conf"
+DOMAIN_ONLY_STATE="$2/protected/absent-state"
+NGINX_MAIN_CONF="$2/protected/absent-main"
+SUDO=''
+nx_access_sync_files() { :; }
+reload_nginx_safe() { :; }
+nx_transaction touch "$CONF_DIR/owned"
+LOCK
+  chmod 644 "$T/lock-test"
+  # Root home is normally private; copy the sources to an accessible fixture.
+  mkdir "$T/source"
+  cp "$ROOT/nx.sh" "$T/source/"
+  cp -r "$ROOT/lib" "$T/source/"
+  runuser -u nobody -- bash "$T/lock-test" "$T/source" "$T"
+  [[ -f "$T/protected/conf/owned" && ! -e "$T/protected/conf.nx-lock" ]]
+  echo 'ok: unprivileged caller locks directory beneath protected parent'
+fi

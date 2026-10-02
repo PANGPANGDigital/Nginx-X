@@ -6,7 +6,6 @@ build_proxy_conf() {
   local backend_port="$3"
   local out="$4"
 
-  ensure_websocket_map
 
   local ipv6_listen
   ipv6_listen="$(nginx_listen_ipv6_line "$listen_port" "")"
@@ -106,7 +105,6 @@ build_external_proxy_conf() {
       return 1
     fi
   done
-  ensure_websocket_map || return 1
 
   https_meta=""
   https_cert_block=""

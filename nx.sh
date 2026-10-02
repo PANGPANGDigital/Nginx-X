@@ -88,7 +88,7 @@ check_cmd() {
 ensure_runtime_dependencies() {
   local cmd pkg
   local -a missing=()
-  for cmd in python3 curl openssl awk sed grep tar; do
+  for cmd in python3 curl openssl awk sed grep tar flock; do
     check_cmd "$cmd" || missing+=("$cmd")
   done
   [[ ${#missing[@]} -gt 0 ]] || return 0
@@ -99,10 +99,10 @@ ensure_runtime_dependencies() {
   fi
   pkg="$(detect_pkg_mgr)"
   case "$pkg" in
-    apt) ${SUDO} apt-get update && ${SUDO} apt-get install -y python3 curl openssl gawk sed grep tar ;;
-    dnf|yum) ${SUDO} "$pkg" install -y python3 curl openssl gawk sed grep tar ;;
-    apk) ${SUDO} apk add python3 curl openssl gawk sed grep tar ;;
-    opkg) ${SUDO} opkg update && ${SUDO} opkg install python3 curl openssl-util gawk sed grep tar ;;
+    apt) ${SUDO} apt-get update && ${SUDO} apt-get install -y python3 curl openssl gawk sed grep tar util-linux ;;
+    dnf|yum) ${SUDO} "$pkg" install -y python3 curl openssl gawk sed grep tar util-linux ;;
+    apk) ${SUDO} apk add python3 curl openssl gawk sed grep tar util-linux ;;
+    opkg) ${SUDO} opkg update && ${SUDO} opkg install python3 curl openssl-util gawk sed grep tar flock ;;
     *) error "请先安装依赖：${missing[*]}"; return 1 ;;
   esac || return 1
   for cmd in "${missing[@]}"; do
@@ -115,6 +115,7 @@ installed_script_target() {
   running="$(readlink -f "$NX_RUNNING_SOURCE")" || return 1
   if [[ -z "${NX_INSTALLED_TARGET:-}" || "$running" != "$NX_INSTALLED_TARGET" ]]; then
     error "当前文件不是已登记的安装入口；请用 install.sh 安装后再更新/卸载。" >&2
+    printf '恢复命令（确认仓库路径后执行）：env TARGET_BIN=%q bash %q --no-run\n' "$running" "$REPO_INSTALL_DIR/install.sh" >&2
     return 1
   fi
   printf '%s\n' "$running"
@@ -221,6 +222,11 @@ ensure_dirs() {
 
 # 写入 WebSocket upgrade map，避免对普通 HTTP 请求发送固定 Connection: upgrade
 ensure_websocket_map() {
+  [[ -f "$NGINX_MAIN_CONF" ]] || return 0
+  if [[ "${NX_IN_TRANSACTION:-0}" != 1 ]]; then
+    nx_transaction true
+    return $?
+  fi
   local map_conf="${CONF_DIR}/00-websocket-map.conf"
 
   # Skip if nginx is not installed yet (no nginx.conf)
@@ -251,7 +257,7 @@ ensure_websocket_map() {
 
   if [[ "$need_inject" -eq 1 ]]; then
     # CONF_DIR is included at root level → inject map into nginx.conf http block
-    local tmp_nginx backup_nginx
+    local tmp_nginx
     tmp_nginx="$(mktemp /tmp/nginxx-map-XXXXXX)"
     trap 'rm -f "${tmp_nginx:-}"' RETURN
     awk '
@@ -269,19 +275,9 @@ ensure_websocket_map() {
       { print }
     ' "$NGINX_MAIN_CONF" > "$tmp_nginx"
 
-    backup_nginx="${NGINX_MAIN_CONF}.bak.$(date +%s).$$"
-    ${SUDO} cp -a "$NGINX_MAIN_CONF" "$backup_nginx"
-    install_managed_file "$tmp_nginx" "$NGINX_MAIN_CONF"
-    if ! reload_nginx_safe; then
-      ${SUDO} cp -a "$backup_nginx" "$NGINX_MAIN_CONF"
-      ${SUDO} rm -f "$backup_nginx"
-      reload_nginx_safe >/dev/null 2>&1 || true
-      error "WebSocket map 写入后校验或重载失败，已恢复 nginx.conf。"
-      return 1
-    fi
-    ${SUDO} rm -f "$backup_nginx"
+    ${SUDO} tee "$NGINX_MAIN_CONF" < "$tmp_nginx" >/dev/null || return 1
     rm -f "$tmp_nginx"
-    info "已将 WebSocket map 注入 nginx.conf http 块。"
+    note "已准备 nginx.conf WebSocket map，等待事务校验。"
     return 0
   fi
 
@@ -297,12 +293,12 @@ map $http_upgrade $connection_upgrade {
     ''      close;
 }
 EOF
-    if ! apply_conf_with_rollback "$tmp_map" "$map_conf"; then
+    if ! nx_write_conf "$tmp_map" "$map_conf"; then
       rm -f "$tmp_map"
       return 1
     fi
     rm -f "$tmp_map"
-    info "已写入 WebSocket map：${map_conf}"
+    note "已准备 WebSocket map：${map_conf}，等待事务校验。"
   fi
 }
 
@@ -3269,7 +3265,8 @@ main_menu() {
 main() {
   ensure_runtime_dependencies || return 1
   ensure_dirs
-  ensure_websocket_map
+  ensure_websocket_map || return 1
+  nx_migrate_certificate_renewal || warn "现有证书续期迁移未完成，请检查后重新启动菜单。"
 
   while true; do
     banner

@@ -327,7 +327,18 @@ try:
         # A certificate-only issuance may have installed a persistent challenge
         # helper. Keep that endpoint rather than generating a duplicate :80 name.
         helper = os.path.join((os.environ.get('NX_HTTPS_CONF_DIR') or os.path.dirname(filename)), 'acme-challenge-' + domain + '.conf')
-        if not os.path.exists(helper):
+        if os.path.exists(helper):
+            # Accept only our exact persistent helper shape. A file name alone
+            # says nothing about its hostname, listener, or challenge routing.
+            helper_text = open(helper, encoding='utf-8').read()
+            normalized = re.sub(r'\s+', ' ', re.sub(r'(?m)#.*$', '', helper_text)).strip()
+            expected = ('server { listen 80; server_name ' + domain + '; '
+                        'location ^~ /.well-known/acme-challenge/ { root /usr/share/nginx/html; '
+                        'default_type "text/plain"; try_files $uri =404; } '
+                        'location / { return 404; } }')
+            if normalized != expected:
+                fail('existing ACME helper is not the expected HTTP-01 endpoint; review it before enabling HTTPS')
+        else:
             edits.append((app['start'], app['start'], block))
         update_frontend('https', target)
         remap_defaults(original, target)

@@ -70,3 +70,18 @@ if REPO_INSTALL_DIR="$root/source" bash "$root/bin/raw-nx" > "$root/refusal.log"
 fi
 cmp "$root/raw-before" "$root/bin/raw-nx"
 echo 'ok: old updater exec migration and bootstrap privilege-boundary paths'
+# The 39007be bundled updater invokes install.sh rather than copying the loader.
+# Freeze its implementation so current identity checks cannot hide regressions.
+printf '#!/bin/sh\nexit 0\n' > "$root/bin/nx"
+PATH="$root/bin:$PATH" REPO_INSTALL_DIR="$root/source" bash -s -- "$repo" "$root" <<'RUN'
+source "$1/nx.sh"
+source "$1/tests/fixtures/legacy-bundle-update.sh"
+SUDO=''
+SCRIPT_DIR="$2/source"
+NX_IN_MENU=1
+update_script
+RUN
+# The upgraded artifact carries its exact install identity for future updates.
+grep -Fq "NX_INSTALLED_TARGET=$root/bin/nx" "$root/bin/nx"
+[[ "$("$root/bin/nx")" == MIGRATED ]]
+echo 'ok: 39007be bundled updater installs registered identity and execs new bundle'
